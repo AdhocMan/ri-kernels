@@ -26,6 +26,8 @@ from .rfi_vis_op import (
     _check_tab_lib,
     _check_tab_lib_gpu,
     _dtype_suffix,
+    _ffi_target,
+    _register_targets,
     prepare_indices,
 )
 
@@ -163,38 +165,27 @@ class RFIAnalyticVisOp:
         )
 
 
-# Keyed on the newest handler so an older library reads as having no analytic
-# kernels rather than failing part way through the registration below.
-_TAB_LIB_ANALYTIC = (
-    _TAB_LIB if _TAB_LIB and hasattr(_TAB_LIB, "calc_rfi_analytic_full_transpose_cpu_f32") else None
-)
-_TAB_LIB_ANALYTIC_GPU = (
-    _TAB_LIB_GPU
-    if _TAB_LIB_GPU and hasattr(_TAB_LIB_GPU, "calc_rfi_analytic_full_transpose_gpu_f32")
-    else None
-)
+_ANALYTIC_PASSES = ("fwd", "jvp", "transpose", "full_jvp", "full_transpose")
+
+
+def _has_analytic(lib, platform):
+    # Keyed on the newest handler so an older library reads as having no analytic
+    # kernels rather than failing part way through the registration below.
+    return lib is not None and hasattr(
+        lib, _ffi_target("rfi_analytic_vis", "full_transpose", platform, "f32")
+    )
+
+
+_TAB_LIB_ANALYTIC = _TAB_LIB if _has_analytic(_TAB_LIB, "cpu") else None
+_TAB_LIB_ANALYTIC_GPU = _TAB_LIB_GPU if _has_analytic(_TAB_LIB_GPU, "gpu") else None
 
 if _TAB_LIB_ANALYTIC:
-    for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
-            jax.ffi.register_ffi_target(
-                f"calc_rfi_analytic{_kind}_{_suffix}",
-                jax.ffi.pycapsule(
-                    getattr(_TAB_LIB_ANALYTIC, f"calc_rfi_analytic{_kind}_cpu_{_suffix}")
-                ),
-                platform="cpu",
-            )
+    _register_targets(_TAB_LIB_ANALYTIC, "rfi_analytic_vis", _ANALYTIC_PASSES, "cpu", "cpu")
 
 if _TAB_LIB_ANALYTIC_GPU:
-    for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
-            jax.ffi.register_ffi_target(
-                f"calc_rfi_analytic{_kind}_gpu_{_suffix}",
-                jax.ffi.pycapsule(
-                    getattr(_TAB_LIB_ANALYTIC_GPU, f"calc_rfi_analytic{_kind}_gpu_{_suffix}")
-                ),
-                platform=_TAB_PLATFORM_NAME,
-            )
+    _register_targets(
+        _TAB_LIB_ANALYTIC_GPU, "rfi_analytic_vis", _ANALYTIC_PASSES, "gpu", _TAB_PLATFORM_NAME
+    )
 
 
 def _check_analytic_lib(platform):
@@ -303,11 +294,11 @@ def _validate_options(*, segments, terms, cubic_terms, scratch_mb):
             raise ValueError(f"{name} must be a static integer in [{lo}, {hi}]")
 
 
-def _lowering(prefix, platform):
+def _lowering(pass_, platform):
     def lowering(ctx, *args, **options):
         _check_analytic_lib(platform)
         suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 1].dtype)
-        target = f"{prefix}{'_gpu' if platform == 'gpu' else ''}_{suffix}"
+        target = _ffi_target("rfi_analytic_vis", pass_, platform, suffix)
         return jax.ffi.ffi_lowering(target)(ctx, *args, **{k: np.int64(v) for k, v in options.items()})
 
     return lowering
@@ -329,8 +320,8 @@ def _transpose_abstract(*args, **options):
 
 
 rfi_analytic_transpose_op.def_abstract_eval(_transpose_abstract)
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("calc_rfi_analytic_transpose", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("calc_rfi_analytic_transpose", "gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "gpu"), platform="gpu")
 
 # The full transpose: the cotangents of the signal and the phase.
 rfi_analytic_full_transpose_op = core.Primitive("rfi_analytic_full_transpose_op")
@@ -349,8 +340,8 @@ def _full_transpose_abstract(*args, **options):
 
 
 rfi_analytic_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
-mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("calc_rfi_analytic_full_transpose", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("calc_rfi_analytic_full_transpose", "gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "gpu"), platform="gpu")
 
 # --- JVP: linear in the signal tangent -----------------------------------------
 
@@ -370,19 +361,19 @@ def _jvp_abstract(*args, **options):
 rfi_analytic_jvp_op.def_abstract_eval(_jvp_abstract)
 
 
-def _jvp_lowering(prefix, platform):
+def _jvp_lowering(pass_, platform):
     # The signal tangent follows the signal, so the phase is one slot later.
     def lowering(ctx, *args, **options):
         _check_analytic_lib(platform)
         suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 2].dtype)
-        target = f"{prefix}{'_gpu' if platform == 'gpu' else ''}_{suffix}"
+        target = _ffi_target("rfi_analytic_vis", pass_, platform, suffix)
         return jax.ffi.ffi_lowering(target)(ctx, *args, **{k: np.int64(v) for k, v in options.items()})
 
     return lowering
 
 
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("calc_rfi_analytic_jvp", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("calc_rfi_analytic_jvp", "gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "gpu"), platform="gpu")
 
 
 def _jvp_transpose(g, *args, **options):
@@ -416,8 +407,8 @@ def _full_jvp_abstract(*args, **options):
 
 
 rfi_analytic_full_jvp_op.def_abstract_eval(_full_jvp_abstract)
-mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("calc_rfi_analytic_full_jvp", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("calc_rfi_analytic_full_jvp", "gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "gpu"), platform="gpu")
 
 
 def _full_jvp_transpose(g, *args, **options):
@@ -449,8 +440,8 @@ def _vis_abstract(*args, **options):
 
 
 rfi_analytic_vis_op.def_abstract_eval(_vis_abstract)
-mlir.register_lowering(rfi_analytic_vis_op, _lowering("calc_rfi_analytic", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_vis_op, _lowering("calc_rfi_analytic", "gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", "gpu"), platform="gpu")
 
 
 def _vis_jvp(args, tangents, **options):
