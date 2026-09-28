@@ -249,7 +249,7 @@ using rfi_amp_f64_t = ffi::Buffer<ffi::C128, 6>;
 using rfi_phase_f64_t = ffi::Buffer<ffi::F64, 6>;
 
 template <ffi::DataType AMP_DT, ffi::DataType PHASE_DT, typename T>
-ffi::Future calc_rfi_transpose_cpu_impl_tmpl(
+ffi::Future rfi_vis_transpose_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -366,7 +366,7 @@ ffi::Future calc_rfi_transpose_cpu_impl_tmpl(
       });
 }
 
-ffi::Future calc_rfi_transpose_cpu_f32_impl(
+ffi::Future rfi_vis_transpose_cpu_f32_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -375,13 +375,13 @@ ffi::Future calc_rfi_transpose_cpu_f32_impl(
     ffi::BufferR3<ffi::C64> rfi_vis_grad,
     ffi::Result<ffi::Buffer<ffi::C64, 6>> rfi_amp_fine_grad,
     ffi::Result<ffi::Buffer<ffi::F32, 6>> rfi_phase_grad) {
-  return calc_rfi_transpose_cpu_impl_tmpl<ffi::C64, ffi::F32, float>(
+  return rfi_vis_transpose_cpu_impl_tmpl<ffi::C64, ffi::F32, float>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start,
       rfi_amp_fine, rfi_phase, rfi_vis_grad, rfi_amp_fine_grad,
       rfi_phase_grad);
 }
 
-ffi::Future calc_rfi_transpose_cpu_f64_impl(
+ffi::Future rfi_vis_transpose_cpu_f64_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -390,7 +390,7 @@ ffi::Future calc_rfi_transpose_cpu_f64_impl(
     ffi::BufferR3<ffi::C128> rfi_vis_grad,
     ffi::Result<ffi::Buffer<ffi::C128, 6>> rfi_amp_fine_grad,
     ffi::Result<ffi::Buffer<ffi::F64, 6>> rfi_phase_grad) {
-  return calc_rfi_transpose_cpu_impl_tmpl<ffi::C128, ffi::F64, double>(
+  return rfi_vis_transpose_cpu_impl_tmpl<ffi::C128, ffi::F64, double>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start,
       rfi_amp_fine, rfi_phase, rfi_vis_grad, rfi_amp_fine_grad,
       rfi_phase_grad);
@@ -398,12 +398,12 @@ ffi::Future calc_rfi_transpose_cpu_f64_impl(
 
 // Exported: see visibility.h. The attribute has to sit inside the extern "C".
 extern "C" RI_KERNELS_API XLA_FFI_Error *
-calc_rfi_transpose_cpu_f32(XLA_FFI_CallFrame *call_frame);
+ri_rfi_vis_transpose_cpu_f32(XLA_FFI_CallFrame *call_frame);
 extern "C" RI_KERNELS_API XLA_FFI_Error *
-calc_rfi_transpose_cpu_f64(XLA_FFI_CallFrame *call_frame);
+ri_rfi_vis_transpose_cpu_f64(XLA_FFI_CallFrame *call_frame);
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_cpu_f32,
-                              calc_rfi_transpose_cpu_f32_impl,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(ri_rfi_vis_transpose_cpu_f32,
+                              rfi_vis_transpose_cpu_f32_impl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::ThreadPool>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()
@@ -418,8 +418,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_cpu_f32,
                                   .Ret<rfi_amp_f32_t>()
                                   .Ret<rfi_phase_f32_t>());
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_transpose_cpu_f64,
-                              calc_rfi_transpose_cpu_f64_impl,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(ri_rfi_vis_transpose_cpu_f64,
+                              rfi_vis_transpose_cpu_f64_impl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::ThreadPool>()
                                   .Arg<ffi::BufferR1<ffi::S32>>()

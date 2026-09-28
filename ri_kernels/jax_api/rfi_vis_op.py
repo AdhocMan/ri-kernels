@@ -152,41 +152,28 @@ if any("rocm" in str(s) for s in list(jax.devices())):
 _TAB_LIB = _load_library("libri_kernels.so")
 _TAB_LIB_GPU = _load_library(_TAB_LIB_GPU_NAME)
 
+
+def _ffi_target(op, pass_, platform, dtype):
+    """Name of an FFI handler: both its exported symbol and its XLA target."""
+    return f"ri_{op}_{pass_}_{platform}_{dtype}"
+
+
+def _register_targets(lib, op, passes, platform, xla_platform):
+    for dtype in ("f32", "f64"):
+        for pass_ in passes:
+            name = _ffi_target(op, pass_, platform, dtype)
+            jax.ffi.register_ffi_target(
+                name, jax.ffi.pycapsule(getattr(lib, name)), platform=xla_platform
+            )
+
+
 if _TAB_LIB:
-    for _suffix in ("f32", "f64"):
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB, f"calc_rfi_vis_cpu_{_suffix}")),
-            platform="cpu",
-        )
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_jvp_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB, f"calc_rfi_jvp_cpu_{_suffix}")),
-            platform="cpu",
-        )
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_transpose_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB, f"calc_rfi_transpose_cpu_{_suffix}")),
-            platform="cpu",
-        )
+    _register_targets(_TAB_LIB, "rfi_vis", ("fwd", "jvp", "transpose"), "cpu", "cpu")
 
 if _TAB_LIB_GPU:
-    for _suffix in ("f32", "f64"):
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_gpu_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB_GPU, f"calc_rfi_vis_gpu_{_suffix}")),
-            platform=_TAB_PLATFORM_NAME,
-        )
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_jvp_gpu_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB_GPU, f"calc_rfi_jvp_gpu_{_suffix}")),
-            platform=_TAB_PLATFORM_NAME,
-        )
-        jax.ffi.register_ffi_target(
-            f"calc_rfi_transpose_gpu_{_suffix}",
-            jax.ffi.pycapsule(getattr(_TAB_LIB_GPU, f"calc_rfi_transpose_gpu_{_suffix}")),
-            platform=_TAB_PLATFORM_NAME,
-        )
+    _register_targets(
+        _TAB_LIB_GPU, "rfi_vis", ("fwd", "jvp", "transpose"), "gpu", _TAB_PLATFORM_NAME
+    )
 
 
 def _dtype_suffix(amp_dtype, phase_dtype):
@@ -254,7 +241,7 @@ def rfi_transpose_lowering_cpu(
 ):
     _check_tab_lib()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_transpose_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "transpose", "cpu", suffix))
     return res(
         ctx,
         a1,
@@ -277,7 +264,7 @@ def rfi_transpose_lowering_gpu(
 ):
     _check_tab_lib_gpu()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_transpose_gpu_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "transpose", "gpu", suffix))
     return res(
         ctx,
         a1,
@@ -342,7 +329,7 @@ def rfi_jvp_lowering_cpu(
 ):
     _check_tab_lib()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[8].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_jvp_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "jvp", "cpu", suffix))
     return res(
             ctx,
             a1,
@@ -376,7 +363,7 @@ def rfi_jvp_lowering_gpu(
 ):
     _check_tab_lib_gpu()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[8].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_jvp_gpu_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "jvp", "gpu", suffix))
     return res(
             ctx,
             a1,
@@ -449,7 +436,7 @@ def rfi_vis_lowering_cpu(
 ):
     _check_tab_lib()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "fwd", "cpu", suffix))
     return res(
             ctx,
             a1,
@@ -471,7 +458,7 @@ def rfi_vis_lowering_gpu(
 ):
     _check_tab_lib_gpu()
     suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(f"calc_rfi_gpu_{suffix}")
+    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "fwd", "gpu", suffix))
     return res(
             ctx,
             a1,

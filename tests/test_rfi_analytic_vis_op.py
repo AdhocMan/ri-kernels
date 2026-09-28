@@ -520,7 +520,7 @@ def test_ffi_rejects_excess_capacity(option, value, device):
     options = dict(segments=np.int64(2), terms=np.int64(6), cubic_terms=np.int64(3),
                    scratch_mb=np.int64(256))
     options[option] = np.int64(value)
-    target = "calc_rfi_analytic" + ("_gpu" if device.platform != "cpu" else "") + "_f64"
+    target = "ri_rfi_analytic_vis_fwd_" + ("cpu" if device.platform == "cpu" else "gpu") + "_f64"
     call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, **options).block_until_ready()
@@ -531,7 +531,7 @@ def test_ffi_rejects_excess_coefficients(device):
     args[5] = jnp.zeros((6, 3, 10), jnp.float64)
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
-    target = "calc_rfi_analytic" + ("_gpu" if device.platform != "cpu" else "") + "_f64"
+    target = "ri_rfi_analytic_vis_fwd_" + ("cpu" if device.platform == "cpu" else "gpu") + "_f64"
     call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, segments=np.int64(2), terms=np.int64(6),

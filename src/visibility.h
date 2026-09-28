@@ -17,13 +17,13 @@
 // Note that the attribute must be placed inside the extern "C" linkage
 // specification. Written in front of it, as in
 //
-//     RI_KERNELS_API XLA_FFI_DECLARE_HANDLER_SYMBOL(calc_rfi_vis_cpu);
+//     RI_KERNELS_API XLA_FFI_DECLARE_HANDLER_SYMBOL(ri_rfi_vis_fwd_cpu_f32);
 //
 // GCC discards it with only a -Wattributes warning and the symbol stays
 // hidden, so declare the handlers by spelling out the signature:
 //
 //     extern "C" RI_KERNELS_API XLA_FFI_Error *
-//     calc_rfi_vis_cpu(XLA_FFI_CallFrame *call_frame);
+//     ri_rfi_vis_fwd_cpu_f32(XLA_FFI_CallFrame *call_frame);
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #define RI_KERNELS_API __declspec(dllexport)

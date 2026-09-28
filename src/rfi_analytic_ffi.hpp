@@ -4,14 +4,14 @@
 // phase tangent and cotangent as well. Options are static FFI attributes;
 // scratch_mb bounds the GPU coefficient scratch and the CPU handlers ignore it.
 // Included once by each platform with its execution context and dispatcher.
-#define RI_ANALYTIC_NAME_I(kind, platform, precision) calc_rfi_analytic##kind##_##platform##_##precision
+#define RI_ANALYTIC_NAME_I(kind, platform, precision) ri_rfi_analytic_vis##kind##_##platform##_##precision
 #define RI_ANALYTIC_NAME_(kind, platform, precision) RI_ANALYTIC_NAME_I(kind, platform, precision)
 #define RI_ANALYTIC_NAME(kind, precision) RI_ANALYTIC_NAME_(kind, RI_ANALYTIC_PLATFORM, precision)
-#define RI_ANALYTIC_IMPL_I(name) name##_impl
-#define RI_ANALYTIC_IMPL_(name) RI_ANALYTIC_IMPL_I(name)
-#define RI_ANALYTIC_IMPL(kind, precision) RI_ANALYTIC_IMPL_(RI_ANALYTIC_NAME(kind, precision))
+#define RI_ANALYTIC_IMPL_I(kind, platform, precision) rfi_analytic_vis##kind##_##platform##_##precision##_impl
+#define RI_ANALYTIC_IMPL_(kind, platform, precision) RI_ANALYTIC_IMPL_I(kind, platform, precision)
+#define RI_ANALYTIC_IMPL(kind, precision) RI_ANALYTIC_IMPL_(kind, RI_ANALYTIC_PLATFORM, precision)
 
-RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(, f32)(
+RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f32)(
     RI_ANALYTIC_CONTEXT,
     analytic_index_t a1,
     analytic_index_t a1_sorter,
@@ -38,9 +38,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(, f32)(
       RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
       wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
 }
-extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(, f32)(XLA_FFI_CallFrame *);
-XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(, f32),
-    RI_ANALYTIC_IMPL(, f32), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
+extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_fwd, f32)(XLA_FFI_CallFrame *);
+XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f32),
+    RI_ANALYTIC_IMPL(_fwd, f32), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
         .Arg<analytic_index_t>()
         .Arg<analytic_index_t>()
         .Arg<analytic_index_t>()
@@ -293,7 +293,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f32),
         .Attr<std::int64_t>("cubic_terms")
         .Attr<std::int64_t>("scratch_mb"));
 
-RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(, f64)(
+RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f64)(
     RI_ANALYTIC_CONTEXT,
     analytic_index_t a1,
     analytic_index_t a1_sorter,
@@ -320,9 +320,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(, f64)(
       RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
       wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
 }
-extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(, f64)(XLA_FFI_CallFrame *);
-XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(, f64),
-    RI_ANALYTIC_IMPL(, f64), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
+extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_fwd, f64)(XLA_FFI_CallFrame *);
+XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f64),
+    RI_ANALYTIC_IMPL(_fwd, f64), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
         .Arg<analytic_index_t>()
         .Arg<analytic_index_t>()
         .Arg<analytic_index_t>()
