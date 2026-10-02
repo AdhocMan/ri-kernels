@@ -16,8 +16,12 @@ namespace ri_kernels {
 namespace ffi = xla::ffi;
 
 // Type aliases to avoid commas inside XLA_FFI_DEFINE_HANDLER_SYMBOL macro args.
-using analytic_amp_f32_t = ffi::Buffer<ffi::C64, 4>;
-using analytic_amp_f64_t = ffi::Buffer<ffi::C128, 4>;
+// The signal is (antenna, source, freq, time, P, 2): P receivers and two
+// latent columns. The visibilities are (baseline, freq, time, P, P).
+using analytic_amp_f32_t = ffi::Buffer<ffi::C64, 6>;
+using analytic_amp_f64_t = ffi::Buffer<ffi::C128, 6>;
+using analytic_vis_f32_t = ffi::Buffer<ffi::C64, 5>;
+using analytic_vis_f64_t = ffi::Buffer<ffi::C128, 5>;
 using analytic_real4_f32_t = ffi::Buffer<ffi::F32, 4>;
 using analytic_real4_f64_t = ffi::Buffer<ffi::F64, 4>;
 using analytic_real3_f32_t = ffi::Buffer<ffi::F32, 3>;
@@ -38,6 +42,13 @@ using analytic_index_t = ffi::BufferR1<ffi::S32>;
 // wave64 AMD part runs the same layout correctly.
 constexpr int kAnalyticTile = 32;
 constexpr int kAnalyticTilePairs = kAnalyticTile * kAnalyticTile;
+
+// Every signal carries two latent columns, a rank-one one a zero second
+// column; P, the receivers per antenna, is one or two. The kernels flatten
+// (P, 2) into the component e = i * kAnalyticColumns + c, row-major like the
+// buffer.
+constexpr int kAnalyticColumns = 2;
+constexpr int kAnalyticMaxPol = 2;
 
 // Tiles needed to cover n_ant antennas. The kernels index partial buffers by
 // it, so it has to be callable on the device as well as in the handlers'

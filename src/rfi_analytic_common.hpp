@@ -7,7 +7,8 @@ namespace ri_kernels {
 template <typename T> struct AnalyticViews {
   Tensor1D<const int *> a1, a2;
   Tensor2D<const int *> pair, tile_pairs;
-  Tensor4D<const Cplx<T> *> amp, amp_dot;
+  // The signal's trailing (P, 2) flattened into the component axis, e = i * 2 + c.
+  Tensor5D<const Cplx<T> *> amp, amp_dot;
   Tensor4D<const T *> phase, phase_dot, delay;
   Tensor3D<const T *> wf, gt;
   Tensor1D<const int *> sf, st;
@@ -16,12 +17,12 @@ template <typename T> struct AnalyticViews {
   AnalyticOptions options;
 };
 
-// Coefficients are laid out antenna-fast.
+// Coefficients are laid out antenna-fast, then by component.
 // There is one frequency-quadrature axis, but no time-quadrature axis.
 TAB_H_D inline std::int64_t analytic_index(std::int64_t cell, std::int64_t r,
-    std::int64_t u, std::int64_t m, std::int64_t ant, std::int64_t nr,
-    std::int64_t nu, std::int64_t nm, std::int64_t na) {
-  return ((((cell * nr + r) * nu + u) * nm + m) * na + ant);
+    std::int64_t u, std::int64_t m, std::int64_t e, std::int64_t ant, std::int64_t nr,
+    std::int64_t nu, std::int64_t nm, std::int64_t ne, std::int64_t na) {
+  return (((((cell * nr + r) * nu + u) * nm + m) * ne + e) * na + ant);
 }
 
 // What a baseline contributes to its weights beyond the tables: the two
@@ -71,10 +72,11 @@ TAB_H_D inline Cplx<T> analytic_cast(Cplx<W> z) { return {T(z.re), T(z.im)}; }
 
 template <typename T>
 TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
-    Tensor4D<const Cplx<T> *> amp, std::int64_t ant, std::int64_t r,
-    std::int64_t f, std::int64_t t, std::int64_t u, std::int64_t m) {
+    Tensor5D<const Cplx<T> *> amp, std::int64_t ant, std::int64_t r,
+    std::int64_t f, std::int64_t t, std::int64_t u, std::int64_t m, std::int64_t e) {
   // The stencil contraction: the frequency weights at fine channel u times
   // coefficient m of the time table, over the cell's stencil of data cells.
+  // Every component shares the tables.
   const auto n_sf = v.wf.shape[1], n_st = v.gt.shape[1];
   const auto n_u = v.wf.shape[2], n_m = v.gt.shape[2];
   const T *wf = v.wf.ptr + f * n_sf * n_u, *gt = v.gt.ptr + t * n_st * n_m;
@@ -84,7 +86,7 @@ TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
     const T wk = wf[k * n_u + u];
     for (std::int64_t l = 0; l < n_st; ++l) {
       const T w = wk * gt[l * n_m + m];
-      const Cplx<T> c = amp(ant, r, sf + k, st + l);
+      const Cplx<T> c = amp(ant, r, sf + k, st + l, e);
       a.re += w * c.re;
       a.im += w * c.im;
     }
@@ -127,10 +129,50 @@ RI_ANALYTIC_INLINE Cplx<T> analytic_contract(const Cplx<T> *p, const Cplx<T> *q,
   return total;
 }
 
+// The pair's P x P matrix: entry (i, j) sums the scalar contraction above over
+// the two latent columns, V_ij = sum_c H p_ic conj(q_jc), against the pair's
+// one set of weights. m_stride steps the polynomial coefficient and e_stride
+// the component e = i * 2 + c. out and primal hold P * P entries, row-major.
+template <bool Default, int P, typename W, typename T>
+RI_ANALYTIC_INLINE void analytic_contract_pol(const Cplx<T> *p, const Cplx<T> *q,
+    const Cplx<T> *dp, const Cplx<T> *dq, const Cplx<W> *h, int count,
+    std::int64_t m_stride, std::int64_t e_stride, bool jvp, Cplx<T> *out,
+    Cplx<T> *primal = nullptr) {
+  RI_ANALYTIC_UNROLL
+  for (int i = 0; i < P; ++i) {
+    RI_ANALYTIC_UNROLL
+    for (int j = 0; j < P; ++j) {
+      Cplx<T> total{0, 0}, base{0, 0};
+      RI_ANALYTIC_UNROLL
+      for (int c = 0; c < kAnalyticColumns; ++c) {
+        const auto ei = (i * kAnalyticColumns + c) * e_stride;
+        const auto ej = (j * kAnalyticColumns + c) * e_stride;
+        Cplx<T> b{0, 0};
+        total = cadd(total, analytic_contract<Default, W>(p + ei, q + ej,
+            jvp ? dp + ei : nullptr, jvp ? dq + ej : nullptr, h, count, m_stride, jvp,
+            primal ? &b : nullptr));
+        base = cadd(base, b);
+      }
+      out[i * P + j] = total;
+      if (primal) primal[i * P + j] = base;
+    }
+  }
+}
+
+// The leading (antenna, source, freq, time) extents of the signal.
+template <typename LHS, typename RHS>
+bool analytic_same_cells(const LHS &signal, const RHS &grid) {
+  const auto a = signal.dimensions(), b = grid.dimensions();
+  if (a.size() < 4 || b.size() != 4) return false;
+  for (std::size_t i = 0; i < 4; ++i)
+    if (a[i] != b[i]) return false;
+  return true;
+}
+
 template <ffi::DataType A, ffi::DataType R>
 ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
-    ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
+    ffi::Buffer<A, 6> amp, ffi::Buffer<A, 6> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt,
     analytic_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
@@ -139,8 +181,10 @@ ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
   const auto w = wf.dimensions(), g = gt.dimensions();
   const auto na = a[0], nr = a[1], nf = a[2], nt = a[3], nb = a1.dimensions()[0];
   const auto ntiles = analytic_tile_count(na);
+  if (a[4] < 1 || a[4] > kAnalyticMaxPol || a[5] != kAnalyticColumns)
+    return ffi::Error::InvalidArgument("Expected a signal of shape (n_ant, n_rfi, n_freq, n_time, P, 2) with P 1 or 2");
   if (na < 1 || nr < 1 || nf < 1 || nt < 1 || a2.dimensions()[0] != nb ||
-      !analytic_same_shape(amp, dot) || !analytic_same_shape(amp, phase) ||
+      !analytic_same_shape(amp, dot) || !analytic_same_cells(amp, phase) ||
       !analytic_same_shape(phase, phase_dot) ||
       d[0] != na || d[1] != nr || d[2] != nt || d[3] < 1 ||
       w[0] != nf || w[1] < 1 || w[1] > nf || w[2] < 1 ||
@@ -178,17 +222,18 @@ ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
 template <typename T, ffi::DataType A, ffi::DataType R>
 AnalyticViews<T> analytic_views(analytic_index_t a1, analytic_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
-    ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
+    ffi::Buffer<A, 6> amp, ffi::Buffer<A, 6> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt,
     analytic_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
     ffi::Buffer<R, 1> freq, AnalyticOptions opt) {
   const auto a = amp.dimensions(), d = delay.dimensions();
+  const auto ne = a[4] * a[5];
   return {
     {a1.typed_data(), a1.dimensions()[0]}, {a2.typed_data(), a2.dimensions()[0]},
     {pair.typed_data(), a[0], a[0]}, {tiles.typed_data(), tiles.dimensions()[0], kAnalyticTilePairs},
-    {reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]},
-    {reinterpret_cast<const Cplx<T> *>(dot.typed_data()), a[0], a[1], a[2], a[3]},
+    {reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3], ne},
+    {reinterpret_cast<const Cplx<T> *>(dot.typed_data()), a[0], a[1], a[2], a[3], ne},
     {phase.typed_data(), a[0], a[1], a[2], a[3]},
     {phase_dot.typed_data(), a[0], a[1], a[2], a[3]},
     {delay.typed_data(), d[0], d[1], d[2], d[3]},
