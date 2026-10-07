@@ -48,23 +48,35 @@ python -m pytest tests
 
 ## RFI visibilities
 
-`RFIVisOp` computes the per-baseline RFI visibility
+`RFIVisOp` computes the per-baseline polarised RFI visibility
 
 ```
-vis[bl, f, t] = mean over (n_int_freq, n_int_time) of
-                sum over n_rfi of A[a1] conj(A[a2]) exp(i (φ[a1] - φ[a2]))
+vis[bl, f, t, i, j] = mean over (n_int_freq, n_int_time) of
+                      sum over n_rfi and c of
+                      A[a1, ..., i, c] conj(A[a2, ..., j, c]) exp(i (φ[a1] - φ[a2]))
 ```
 
-for amplitudes `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
-n_int_time)` and phases `φ` in radians of the same shape, giving an output of
-shape `(n_baselines, n_freq, n_time)`. It is constructed from the baseline
-layout and evaluated through `eval`:
+for signal factors `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
+n_int_time, P, 2)` and phases `φ` in radians shaped `(n_ant, n_freq, n_time,
+n_rfi, n_int_freq, n_int_time)`, giving an output of shape `(n_baselines,
+n_freq, n_time, P, P)`. It is constructed from the baseline layout and
+evaluated through `eval`:
 
 ```python
 from ri_kernels.jax_api import RFIVisOp
 
 vis = RFIVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_phase)
 ```
+
+As for `RFIAnalyticVisOp` below, the signal is a two-column factor per
+receiver (P is 1 or 2). Pad a rank-one signal with a zero second column; a
+zero column still permits X/Y response and leakage. P = 1 gives one
+same-receiver correlation such as XX, and P = 2 gives `[[XX, XY], [YX, YY]]`.
+The phase is common to every receiver and column, so the kernels compute one
+phase factor per fine sample for all P × P entries. A reversed baseline is the
+conjugate transpose, which exchanges XY and YX. `eval` moves the `(P, 2)` axes
+in front of the fine-sample axes before calling the kernels, which keeps each
+component contiguous for SIMD and coalesced loads.
 
 The operator has native primal, JVP, and transpose kernels for CPU, CUDA, and
 ROCm, so both forward- and reverse-mode differentiation stay inside the
