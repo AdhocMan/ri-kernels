@@ -6,17 +6,20 @@
 
 namespace ri_kernels {
 
-// The signal of RFIVisOp, as the kernels see it, is
-// (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time): P receivers
-// per antenna (one or two) and two latent columns, a rank-one signal padded
-// with a zero second column. The Python wrapper moves (P, 2) in front of the
-// reduction axes, so that each component is contiguous over
-// n_red = n_rfi * n_int_freq * n_int_time. The kernels flatten (P, 2) into the
-// component e = i * kRfiColumns + c, row-major like the buffer. The phase is
-// (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time), shared by every
-// component, and the visibilities are (n_bl, n_freq, n_time, P, P).
+// Both operators, RFIVisOp and RFIAnalyticVisOp, take a signal with P
+// receivers per antenna (one or two) and two latent columns, a rank-one signal
+// padded with a zero second column. Their kernels flatten (P, 2) into the
+// component e = i * kRfiColumns + c, row-major like the buffer, and return
+// (n_bl, n_freq, n_time, P, P) visibilities.
 constexpr int kRfiColumns = 2;
 constexpr int kRfiMaxPol = 2;
+
+// The signal of RFIVisOp, as the kernels see it, is
+// (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time). The Python
+// wrapper moves (P, 2) in front of the reduction axes, so that each component
+// is contiguous over n_red = n_rfi * n_int_freq * n_int_time. The phase is
+// (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time), shared by every
+// component.
 
 // Checks a signal and its phase against each other.
 template <typename AMP, typename PHASE>
@@ -50,6 +53,8 @@ xla::ffi::Error rfi_validate_vis(const VIS &vis, std::int64_t n_bl,
   return xla::ffi::Error::Success();
 }
 
+// Tangents and cotangents are read through views built from the primal
+// extents, so a mismatched buffer would run off the end rather than fail.
 template <typename X, typename Y> bool rfi_same_shape(const X &x, const Y &y) {
   const auto a = x.dimensions(), b = y.dimensions();
   if (a.size() != b.size()) return false;

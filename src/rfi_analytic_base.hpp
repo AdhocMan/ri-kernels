@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "rfi_vis_common.hpp"
 #include "tensor.hpp"
 #include "xla/ffi/api/ffi.h"
 
@@ -42,13 +43,6 @@ using analytic_index_t = ffi::BufferR1<ffi::S32>;
 // wave64 AMD part runs the same layout correctly.
 constexpr int kAnalyticTile = 32;
 constexpr int kAnalyticTilePairs = kAnalyticTile * kAnalyticTile;
-
-// Every signal carries two latent columns, a rank-one one a zero second
-// column; P, the receivers per antenna, is one or two. The kernels flatten
-// (P, 2) into the component e = i * kAnalyticColumns + c, row-major like the
-// buffer.
-constexpr int kAnalyticColumns = 2;
-constexpr int kAnalyticMaxPol = 2;
 
 // Tiles needed to cover n_ant antennas. The kernels index partial buffers by
 // it, so it has to be callable on the device as well as in the handlers'
@@ -96,19 +90,6 @@ template <typename T> TAB_H_D inline void sincos_t(T x, T *s, T *c) {
   *s = std::sin(x);
   *c = std::cos(x);
 #endif
-}
-
-// Tangents and cotangents are read through views built from the primal
-// extents, so a mismatched buffer would run off the end rather than fail.
-template <typename LHS, typename RHS>
-bool analytic_same_shape(const LHS &lhs, const RHS &rhs) {
-  const auto a = lhs.dimensions();
-  const auto b = rhs.dimensions();
-  if (a.size() != b.size()) return false;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
 }
 
 } // namespace ri_kernels

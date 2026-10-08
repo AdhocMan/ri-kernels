@@ -35,6 +35,8 @@ def ref_rfi_vis_kernel(rfi_amp_fine, rfi_phase, a1, a2):
         rfi_amp_fine[a1],
         jnp.conjugate(rfi_amp_fine[a2]),
         rotation,
+        # Ampere and later GPUs would otherwise contract f32 in TF32.
+        precision=jax.lax.Precision.HIGHEST,
     )
     # (n_bl, n_freq, n_time, n_int_freq, n_int_time, P, P) -> (n_bl, n_freq, n_time, P, P)
     return jnp.mean(vis_rfi_fine, axis=(3, 4))

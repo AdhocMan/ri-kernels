@@ -103,7 +103,7 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
   constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
   constexpr bool Phase = Mode >= 3;
   constexpr int pairs_per_thread = kAnalyticTilePairs / kAnalyticBlock;
-  constexpr int ne = P * kAnalyticColumns, npp = P * P;
+  constexpr int ne = P * kRfiColumns, npp = P * P;
   extern __shared__ __align__(16) unsigned char shared[];
   const auto nm = v.gt.shape[2], na = v.amp.shape[0], nr = v.amp.shape[1], nu = v.wf.shape[2];
   const auto ntiles = analytic_tile_count(na);
@@ -197,34 +197,9 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
                   g[i * P + j] = cscale(T(1) / T(nu), gij);
                 }
               }
-              // For V_ij = sum_c H p_ic conj(q_jc): p_bar_ic = g_ij H conj(q_jc)
-              // and q_bar_jc = conj(g_ij H p_ic), summed over the other index.
-              const int n = Default ? AnalyticStorage<Default>::coefficients : int(nm);
-              RI_ANALYTIC_UNROLL
-              for (int c = 0; c < kAnalyticColumns; ++c) {
-                RI_ANALYTIC_UNROLL
-                for (int a = 0; a < n; ++a) {
-                  RI_ANALYTIC_UNROLL
-                  for (int i = 0; i < P; ++i) {
-                    Cplx<T> gp{0, 0}, gq{0, 0};
-                    RI_ANALYTIC_UNROLL
-                    for (int j = 0; j < P; ++j) {
-                      RI_ANALYTIC_UNROLL
-                      for (int b = 0; b < n; ++b) {
-                        // gp: p's receiver i against q's j; gq: q's receiver i
-                        // against p's j, whose cotangent entry is g_ji.
-                        gp = cadd(gp, cmul(cmul(g[i * P + j], h[a + b]),
-                                           cconj(sj[(b * ne + j * kAnalyticColumns + c) * kAnalyticTile + jl])));
-                        gq = cadd(gq, cmul(cmul(g[j * P + i], h[a + b]),
-                                           si[(b * ne + j * kAnalyticColumns + c) * kAnalyticTile + il]));
-                      }
-                    }
-                    const auto slot = (a * ne + i * kAnalyticColumns + c) * kAnalyticTile;
-                    analytic_atomic(xi + slot + il, gp);
-                    analytic_atomic((I == J ? xi : xj) + slot + jl, cconj(gq));
-                  }
-                }
-              }
+              analytic_transpose_pol<Default, P, T>(si + il, sj + jl, g, h, int(nm),
+                  ne * kAnalyticTile, kAnalyticTile, xi + il, (I == J ? xi : xj) + jl,
+                  [](Cplx<T> *dest, Cplx<T> value) { analytic_atomic(dest, value); });
               if constexpr (Phase) {
                 Cplx<T> z[npp];
                 analytic_contract_pol<Default, P, T>(si + il, sj + jl, si + il, sj + jl, h, int(nm),
@@ -350,7 +325,7 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
     const Cplx<T> *cotangent, T *phase_output) {
   constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
   constexpr bool Phase = Mode >= 3;
-  constexpr int ne = P * kAnalyticColumns, npp = P * P;
+  constexpr int ne = P * kRfiColumns, npp = P * P;
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nf = v.amp.shape[2], nt = v.amp.shape[3];
   const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = analytic_tile_count(na);
   std::int64_t per_cell, phase_per_time = 0;
@@ -430,39 +405,23 @@ ffi::Error analytic_gpu_dispatch(cudaStream_t stream, ffi::ScratchAllocator &scr
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   const AnalyticOptions options{segments, terms, cubic_terms};
-  auto status = analytic_validate(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-                                 wf, sf, gt, st, dnu, duration, freq, options, false);
+  auto status = analytic_validate<Mode>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
+                                       wf, sf, gt, st, dnu, duration, freq, cot, *out, phase_bar,
+                                       options, false);
   if (!status.success()) return status;
   std::int64_t scratch_budget;
   if (!analytic_scratch_bytes(scratch_mb, scratch_budget))
     return ffi::Error::InvalidArgument("Expected scratch_mb to be a positive size in MiB");
-  const auto a = amp.dimensions();
-  const std::int64_t nb = a1.element_count(), npol = a[4];
-  const auto vis_shape = [&](auto dims) {
-    return dims[0] == nb && dims[1] == a[2] && dims[2] == a[3] && dims[3] == npol && dims[4] == npol;
-  };
-  if constexpr (Mode == 2 || Mode == 4) {
-    if (!analytic_same_shape(amp, *out) || !vis_shape(cot.dimensions()))
-      return ffi::Error::InvalidArgument("Invalid analytic transpose output or cotangent shape");
-    if (Mode == 4 && !analytic_same_shape(phase, **phase_bar))
-      return ffi::Error::InvalidArgument("Expected the phase cotangent to match the phase");
-  } else {
-    if (!vis_shape(out->dimensions()))
-      return ffi::Error::InvalidArgument("Invalid analytic visibility output shape");
-  }
   auto v = analytic_views<T>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
                              wf, sf, gt, st, dnu, duration, freq, options);
   auto output = reinterpret_cast<Cplx<T> *>(out->typed_data());
   auto cotangent = reinterpret_cast<const Cplx<T> *>(cot.typed_data());
   T *phase_output = Mode == 4 ? (*phase_bar)->typed_data() : nullptr;
   const bool defaults = analytic_is_default(gt.dimensions()[2], options);
-  if (defaults && npol == 2)
-    return analytic_gpu_launch<true, Mode, 2>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
-  if (defaults)
-    return analytic_gpu_launch<true, Mode, 1>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
-  if (npol == 2)
-    return analytic_gpu_launch<false, Mode, 2>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
-  return analytic_gpu_launch<false, Mode, 1>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
+  return analytic_specialise(defaults, amp.dimensions()[4], [&](auto d, auto p) {
+    return analytic_gpu_launch<decltype(d)::value, Mode, decltype(p)::value>(
+        stream, scratch, scratch_budget, v, output, cotangent, phase_output);
+  });
 }
 
 #define RI_ANALYTIC_CONTEXT cudaStream_t stream, ffi::ScratchAllocator scratch

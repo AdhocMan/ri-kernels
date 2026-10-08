@@ -11,7 +11,9 @@ transpose.
 The primitives see the signal with (P, 2) moved in front of the reduction
 axes, (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time), so that
 each component is contiguous over the fine samples; ``RFIVisOp.eval`` does
-the move, and JAX differentiates through it.
+the move, and JAX differentiates through it. When the signal is computed in
+the same jit, XLA fuses the move into that computation; a signal that enters
+the jit as an argument is copied on every call.
 """
 
 import ctypes

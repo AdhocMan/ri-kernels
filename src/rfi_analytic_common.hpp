@@ -144,9 +144,9 @@ RI_ANALYTIC_INLINE void analytic_contract_pol(const Cplx<T> *p, const Cplx<T> *q
     for (int j = 0; j < P; ++j) {
       Cplx<T> total{0, 0}, base{0, 0};
       RI_ANALYTIC_UNROLL
-      for (int c = 0; c < kAnalyticColumns; ++c) {
-        const auto ei = (i * kAnalyticColumns + c) * e_stride;
-        const auto ej = (j * kAnalyticColumns + c) * e_stride;
+      for (int c = 0; c < kRfiColumns; ++c) {
+        const auto ei = (i * kRfiColumns + c) * e_stride;
+        const auto ej = (j * kRfiColumns + c) * e_stride;
         Cplx<T> b{0, 0};
         total = cadd(total, analytic_contract<Default, W>(p + ei, q + ej,
             jvp ? dp + ei : nullptr, jvp ? dq + ej : nullptr, h, count, m_stride, jvp,
@@ -155,6 +155,57 @@ RI_ANALYTIC_INLINE void analytic_contract_pol(const Cplx<T> *p, const Cplx<T> *q
       }
       out[i * P + j] = total;
       if (primal) primal[i * P + j] = base;
+    }
+  }
+}
+
+// The transpose of analytic_contract_pol. With g the pair's P x P cotangent,
+// V_ij = sum_c H p_ic conj(q_jc) gives p_bar_ic = sum_j g_ij H conj(q_jc) and
+// q_bar_jc = conj(sum_i g_ij H p_ic), H convolving the coefficient index. The
+// cotangent is folded into the partner's coefficients first, y_p[b][i] =
+// sum_j g_ij conj(q_bjc) and y_q[b][j] = sum_i g_ij p_bic, so each weight
+// multiplies once per coefficient pair rather than once per matrix entry.
+// p_bar and q_bar share p's and q's strides; add(dest, value) accumulates.
+template <bool Default, int P, typename W, typename T, typename Add>
+RI_ANALYTIC_INLINE void analytic_transpose_pol(const Cplx<T> *p, const Cplx<T> *q,
+    const Cplx<T> *g, const Cplx<W> *h, int count, std::int64_t m_stride,
+    std::int64_t e_stride, Cplx<T> *p_bar, Cplx<T> *q_bar, Add add) {
+  constexpr int N = AnalyticStorage<Default>::coefficients;
+  const int n = Default ? N : count;
+  assert(n == count && n >= 1 && n <= N);
+  RI_ANALYTIC_UNROLL
+  for (int c = 0; c < kRfiColumns; ++c) {
+    Cplx<T> yp[N][P], yq[N][P];
+    RI_ANALYTIC_UNROLL
+    for (int b = 0; b < n; ++b) {
+      RI_ANALYTIC_UNROLL
+      for (int i = 0; i < P; ++i) {
+        Cplx<T> zp{0, 0}, zq{0, 0};
+        RI_ANALYTIC_UNROLL
+        for (int j = 0; j < P; ++j) {
+          const auto o = b * m_stride + (j * kRfiColumns + c) * e_stride;
+          zp = cadd(zp, cmul(g[i * P + j], cconj(q[o])));
+          zq = cadd(zq, cmul(g[j * P + i], p[o]));
+        }
+        yp[b][i] = zp;
+        yq[b][i] = zq;
+      }
+    }
+    RI_ANALYTIC_UNROLL
+    for (int a = 0; a < n; ++a) {
+      RI_ANALYTIC_UNROLL
+      for (int i = 0; i < P; ++i) {
+        Cplx<T> zp{0, 0}, zq{0, 0};
+        RI_ANALYTIC_UNROLL
+        for (int b = 0; b < n; ++b) {
+          const auto hab = analytic_cast<T, W>(h[a + b]);
+          zp = cadd(zp, cmul(hab, yp[b][i]));
+          zq = cadd(zq, cmul(hab, yq[b][i]));
+        }
+        const auto o = a * m_stride + (i * kRfiColumns + c) * e_stride;
+        add(p_bar + o, zp);
+        add(q_bar + o, cconj(zq));
+      }
     }
   }
 }
@@ -169,23 +220,27 @@ bool analytic_same_cells(const LHS &signal, const RHS &grid) {
   return true;
 }
 
-template <ffi::DataType A, ffi::DataType R>
+// Mode is the handler's (see analytic_tiles): out is the visibilities for
+// modes 0, 1 and 3 and the signal's cotangent for the transposes 2 and 4, and
+// phase_bar the phase's cotangent for mode 4. cot is read by the transposes only.
+template <int Mode, ffi::DataType A, ffi::DataType R, std::size_t OutRank>
 ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
     ffi::Buffer<A, 6> amp, ffi::Buffer<A, 6> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt,
     analytic_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
-    ffi::Buffer<R, 1> freq, AnalyticOptions opt, bool cpu) {
+    ffi::Buffer<R, 1> freq, ffi::Buffer<A, 5> cot, ffi::Buffer<A, OutRank> out,
+    ffi::Result<ffi::Buffer<R, 4>> *phase_bar, AnalyticOptions opt, bool cpu) {
   const auto a = amp.dimensions(), p = phase.dimensions(), d = delay.dimensions();
   const auto w = wf.dimensions(), g = gt.dimensions();
   const auto na = a[0], nr = a[1], nf = a[2], nt = a[3], nb = a1.dimensions()[0];
   const auto ntiles = analytic_tile_count(na);
-  if (a[4] < 1 || a[4] > kAnalyticMaxPol || a[5] != kAnalyticColumns)
+  if (a[4] < 1 || a[4] > kRfiMaxPol || a[5] != kRfiColumns)
     return ffi::Error::InvalidArgument("Expected a signal of shape (n_ant, n_rfi, n_freq, n_time, P, 2) with P 1 or 2");
   if (na < 1 || nr < 1 || nf < 1 || nt < 1 || a2.dimensions()[0] != nb ||
-      !analytic_same_shape(amp, dot) || !analytic_same_cells(amp, phase) ||
-      !analytic_same_shape(phase, phase_dot) ||
+      !rfi_same_shape(amp, dot) || !analytic_same_cells(amp, phase) ||
+      !rfi_same_shape(phase, phase_dot) ||
       d[0] != na || d[1] != nr || d[2] != nt || d[3] < 1 ||
       w[0] != nf || w[1] < 1 || w[1] > nf || w[2] < 1 ||
       g[0] != nt || g[1] < 1 || g[1] > nt || g[2] < 1 ||
@@ -195,6 +250,17 @@ ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
       tiles.dimensions()[0] != ntiles * (ntiles + 1) / 2 ||
       tiles.dimensions()[1] != kAnalyticTilePairs)
     return ffi::Error::InvalidArgument("Incompatible analytic signal, tangent, table, or baseline shapes");
+  const auto vis_shape = [&](auto v) {
+    return v[0] == nb && v[1] == nf && v[2] == nt && v[3] == a[4] && v[4] == a[4];
+  };
+  if constexpr (Mode == 2 || Mode == 4) {
+    if (!rfi_same_shape(amp, out) || !vis_shape(cot.dimensions()))
+      return ffi::Error::InvalidArgument("Invalid analytic transpose output or cotangent shape");
+    if (Mode == 4 && !rfi_same_shape(phase, **phase_bar))
+      return ffi::Error::InvalidArgument("Expected the phase cotangent to match the phase");
+  } else if (!vis_shape(out.dimensions())) {
+    return ffi::Error::InvalidArgument("Invalid analytic visibility output shape");
+  }
   if (!analytic_configuration_fits(g[2], opt))
     return ffi::Error::InvalidArgument(
         "Analytic configuration exceeds compiled coefficient or moment capacity, or has invalid integration options");
@@ -217,6 +283,18 @@ ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
     }
   }
   return ffi::Error::Success();
+}
+
+// Calls f(std::bool_constant<Default>{}, std::integral_constant<int, P>{})
+// with the compiled specialisation that serves a call: the default or the
+// general storage, and one or two receivers.
+template <typename F>
+decltype(auto) analytic_specialise(bool defaults, std::int64_t npol, F &&f) {
+  static_assert(kRfiMaxPol == 2, "Every supported P needs a specialisation here");
+  using One = std::integral_constant<int, 1>;
+  using Two = std::integral_constant<int, 2>;
+  if (defaults) return npol == 2 ? f(std::true_type{}, Two{}) : f(std::true_type{}, One{});
+  return npol == 2 ? f(std::false_type{}, Two{}) : f(std::false_type{}, One{});
 }
 
 template <typename T, ffi::DataType A, ffi::DataType R>
