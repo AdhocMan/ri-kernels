@@ -14,7 +14,10 @@ tangents are symbolic zeros. One transpose kernel serves both and always
 returns the phase cotangent with the signal's; the signal-only JVP drops it.
 The delay's derivative needs three further weight orders, so the full JVP and
 the transpose form it only under their static ``delay_grad``, which the JVP
-rule sets when the delay tangent is not a symbolic zero. The integration
+rule sets when the delay tangent is not a symbolic zero. The transpose rule
+clears it when that tangent is a constant of the transposed map, and the
+transpose's dead-code elimination rule clears it when the delay cotangent is
+unused. The integration
 interval and the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops
 their gradients.
 """
@@ -26,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
-from jax.interpreters import ad, mlir, xla
+from jax.interpreters import ad, mlir, partial_eval as pe, xla
 
 from .rfi_vis_op import (
     _TAB_LIB,
@@ -340,6 +343,20 @@ def _full_transpose_abstract(*args, **options):
 
 
 rfi_analytic_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
+
+
+def _full_transpose_dce(used_outputs, eqn):
+    # Dead-code elimination (jit runs it before lowering): drop the delay's
+    # cotangent when nothing reads it, as when only the signal's and the
+    # phase's gradients are kept.
+    if not any(used_outputs):
+        return [False] * len(eqn.invars), None
+    if eqn.params["delay_grad"] and not used_outputs[2]:
+        eqn = eqn.replace(params={**eqn.params, "delay_grad": False})
+    return [True] * len(eqn.invars), eqn
+
+
+pe.dce_rules[rfi_analytic_full_transpose_op] = _full_transpose_dce
 mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "cpu"), platform="cpu")
 mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "gpu"), platform="gpu")
 
@@ -417,14 +434,16 @@ mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "gpu"
 
 def _full_jvp_transpose(g, *args, **options):
     indices = args[:N_IDX]
-    amp, _, phase, _, delay, _ = args[N_IDX:N_IDX + 6]
+    amp, _, phase, _, delay, delay_dot = args[N_IDX:N_IDX + 6]
     tables = args[N_IDX + 6:]
+    # The delay's cotangent is wanted only when its tangent is a linear input
+    # of the map being transposed; a known tangent is a constant of it.
+    delay_grad = options.pop("delay_grad") and ad.is_undefined_primal(delay_dot)
     amp_bar, phase_bar, delay_bar = rfi_analytic_full_transpose_op.bind(
-        *indices, amp, phase, delay, *tables, g, **options
+        *indices, amp, phase, delay, *tables, g, delay_grad=delay_grad, **options
     )
-    # Cotangents for the linear inputs, at their tangent slots; the delay
-    # tangent is a constant of the map without delay_grad.
-    delay_bar = delay_bar if options["delay_grad"] else None
+    # Cotangents for the linear inputs, at their tangent slots.
+    delay_bar = delay_bar if delay_grad else None
     return ((None,) * N_IDX + (None, amp_bar, None, phase_bar, None, delay_bar)
             + (None,) * len(tables))
 

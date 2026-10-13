@@ -139,7 +139,10 @@ order's derivative weights and `s` what a unit of the order adds to its angle.
 Orders above three, and the third with `cubic_terms=0`, get a zero gradient.
 The three further weight orders make the delay derivative cost about half as
 much again as the full pass without it, so the full JVP and the transpose form
-it only when the delay tangent is not a symbolic zero.
+it only when the delay tangent is not a symbolic zero. The transpose further
+skips it when the delay tangent is a constant of the map being transposed,
+and under `jax.jit` dead-code elimination switches it off when nothing reads
+the delay cotangent (say, only the amplitude and phase gradients are kept).
 
 The JVP rule binds the signal-only JVP whenever the phase and delay tangents
 are symbolic zeros, so a fixed orbit's forward mode computes no phase

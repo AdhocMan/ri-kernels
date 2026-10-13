@@ -406,6 +406,32 @@ def test_the_signal_only_jvp_serves_a_fixed_phase_and_delay():
     assert forward(lambda x: op.eval(*args[:2], x, *args[3:]), args[2]) == ({"rfi_analytic_full_jvp_op"}, True)
 
 
+def test_the_delay_cotangent_is_formed_only_when_read():
+    """A delay tangent that is a constant of the transposed map, or a delay
+    cotangent that jit finds unused, leaves the delay's derivative out."""
+    args = make_inputs(jnp.float32, jnp.complex64)
+    a1, a2 = make_baselines(args[0].shape[0])
+    op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
+    fn = lambda a, p, d: op.eval(a, p, d, *args[3:])
+
+    def lin(t):
+        # Concrete zero tangents for the phase and the delay: the full JVP.
+        zeros = (jnp.zeros_like(args[1]), jnp.zeros_like(args[2]))
+        return jax.jvp(fn, tuple(args[:3]), (t, *zeros))[1]
+
+    assert "delay_grad=True" in str(jax.make_jaxpr(lin)(args[0]))
+    cot = jnp.ones(lin(args[0]).shape, dtype=jnp.complex64)
+    assert "delay_grad=True" not in str(jax.make_jaxpr(jax.linear_transpose(lin, args[0]))(cot))
+
+    loss = lambda *x: jnp.sum(jnp.abs(fn(*x)) ** 2)
+    every = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+    kept = jax.jit(lambda *x: jax.grad(loss, argnums=(0, 1, 2))(*x)[:2])
+    assert "delay_grad = 1" in every.lower(*args[:3]).as_text()
+    assert "delay_grad = 0" in kept.lower(*args[:3]).as_text()
+    for x, y in zip(kept(*args[:3]), every(*args[:3])):
+        np.testing.assert_array_equal(x, y)
+
+
 def test_cubic_translation_matters(device):
     args = make_inputs(jnp.float64, jnp.complex128, n_ant=2, n_rfi=1, n_freq=1, n_time=3, n_int_f=1)
     args[2] = jnp.zeros_like(args[2]).at[0, :, :, 3].set(.0005)
