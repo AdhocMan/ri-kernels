@@ -1,4 +1,4 @@
-"""Time compiled forward, JVP and VJP, signal-only and full, with synchronised GPU execution.
+"""Time compiled forward, JVP and VJP, signal-only, with the phase and with the delay, with synchronised GPU execution.
 
 Run from a built checkout with, for example:
   python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
@@ -51,23 +51,30 @@ def main():
                     ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
                     fn = lambda a: ref(a, *args[1:])
                     fn2 = lambda a, p: ref(a, p, *args[2:])
+                    fn3 = lambda a, p, d: ref(a, p, d, *args[3:])
                 else:
                     fn = lambda a: op.eval(a, *args[1:])
                     fn2 = lambda a, p: op.eval(a, p, *args[2:])
+                    fn3 = lambda a, p, d: op.eval(a, p, d, *args[3:])
                 tangent = jnp.full_like(args[0], .3 + .7j)
                 phase_tangent = jnp.full_like(args[1], .1)
+                delay_tangent = jnp.full_like(args[2], 1e-3)
                 cotangent = jnp.full((len(a1), options.channels, options.cells), .7 - .2j, complex_)
-                amp, phase = args[0], args[1]
-                # The full pair carries the phase derivative as well.
+                amp, phase, delay = args[0], args[1], args[2]
+                # The full pair carries the phase derivative as well, the
+                # delay pair the delay's besides.
                 calls = {
                     "forward": jax.jit(fn),
                     "jvp": jax.jit(lambda a: jax.jvp(fn, (a,), (tangent,))[1]),
                     "vjp": jax.jit(lambda a: jax.vjp(fn, a)[1](cotangent)[0]),
                     "full-jvp": jax.jit(lambda a, p: jax.jvp(fn2, (a, p), (tangent, phase_tangent))[1]),
                     "full-vjp": jax.jit(lambda a, p: jax.vjp(fn2, a, p)[1](cotangent)),
+                    "delay-jvp": jax.jit(lambda a, p, d: jax.jvp(
+                        fn3, (a, p, d), (tangent, phase_tangent, delay_tangent))[1]),
+                    "delay-vjp": jax.jit(lambda a, p, d: jax.vjp(fn3, a, p, d)[1](cotangent)),
                 }
                 for kind, call in calls.items():
-                    inputs = (amp, phase) if kind.startswith("full") else (amp,)
+                    inputs = {"full": (amp, phase), "delay": (amp, phase, delay)}.get(kind.split("-")[0], (amp,))
                     # A case that cannot run -- one that needs more shared
                     # memory or scratch than the card offers -- is a result,
                     # not a reason to lose the sweep.

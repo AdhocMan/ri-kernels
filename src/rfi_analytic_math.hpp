@@ -67,16 +67,17 @@ template <> RI_ANALYTIC_INLINE Cplx<float> analytic_exp<float>(double x) {
   return {(n == 1 || n == 2) ? -cs : cs, (n == 2 || n == 3) ? -sn : sn};
 }
 
-// C(n, k), with the loop bounded by the widest product the storage allows
-// rather than by k. The bound is what matters: given a trip count it cannot
-// see, the compiler keeps the loop and its divide instead of folding the
-// coefficient away, and the translation at the end of a segment reaches this
-// once per (m, j) per segment per baseline. Left as a run-time loop it cost
-// more than every other line of the weight put together.
+// C(n, k), with the loop bounded by the widest weight order the caller's
+// storage allows rather than by k. The bound is what matters: given a trip
+// count it cannot see, the compiler keeps the loop and its divide instead of
+// folding the coefficient away, and the translation at the end of a segment
+// reaches this once per (m, j) per segment per baseline. Left as a run-time
+// loop it cost more than every other line of the weight put together.
+template <int Bound>
 RI_ANALYTIC_INLINE constexpr double analytic_binomial(int n, int k) {
   double v = 1;
   RI_ANALYTIC_UNROLL
-  for (int i = 1; i <= AnalyticStorage<false>::product; ++i)
+  for (int i = 1; i <= Bound; ++i)
     if (i <= k) v *= double(n - i + 1) / i;
   return v;
 }
@@ -166,9 +167,9 @@ TAB_H_D inline Cplx<double> analytic_fresnel(double u) {
 // The default path unrolls the requested orders. The 64-order tail carries
 // only one complex scalar; after that each stored order has a compile-time
 // index, so the CUDA compiler can keep the recurrence in registers.
-template <bool Default, typename W>
+template <bool Default, typename W, int Extra = 0>
 RI_ANALYTIC_INLINE void analytic_linear(double a, int requested, Cplx<W> *values) {
-  using Storage = AnalyticStorage<Default>;
+  using Storage = AnalyticStorage<Default, Extra>;
   const int degree = Default ? Storage::linear - 1 : requested;
   assert(requested == degree && degree >= 0 && degree < Storage::linear);
   const double aa = fabs(a);
@@ -205,10 +206,14 @@ RI_ANALYTIC_INLINE void analytic_linear(double a, int requested, Cplx<W> *values
   }
 }
 
-template <bool Default, typename W>
+// With Extra orders past the product's, tail[n] for n <= requested - Extra is
+// what the curvature series leaves out of the derivative in b: the series
+// differentiates to i (moments[n + 2] - tail[n]), one term short, where the
+// exact moments of the Fresnel branch differentiate to i moments[n + 2].
+template <bool Default, typename W, int Extra = 0>
 RI_ANALYTIC_INLINE void analytic_quadratic(double a, double b, int requested, int nterms,
-                                           Cplx<W> *moments) {
-  using Storage = AnalyticStorage<Default>;
+                                           Cplx<W> *moments, Cplx<W> *tail = nullptr) {
+  using Storage = AnalyticStorage<Default, Extra>;
   const int degree = Default ? Storage::moments - 1 : requested;
   const int terms = Default ? Storage::terms : nterms;
   assert(requested == degree && nterms == terms);
@@ -230,9 +235,13 @@ RI_ANALYTIC_INLINE void analytic_quadratic(double a, double b, int requested, in
       z = cadd(z, cscale(-aw, ctimes_i(moments[m - 1])));
       moments[m] = cscale(half_over_b, ctimes_i(z));
     }
+    if constexpr (Extra > 0) {
+      RI_ANALYTIC_UNROLL
+      for (int n = 0; n <= degree - Extra; ++n) tail[n] = {0, 0};
+    }
   } else {
     Cplx<W> linear[Storage::linear];
-    analytic_linear<Default, W>(a, degree + 2 * (terms - 1), linear);
+    analytic_linear<Default, W, Extra>(a, degree + 2 * (terms - 1), linear);
     // The k = 0 term seeds the sum rather than adding to a zeroed array: the
     // coefficient is one, so the whole first pass would be a copy.
     RI_ANALYTIC_UNROLL
@@ -249,6 +258,12 @@ RI_ANALYTIC_INLINE void analytic_quadratic(double a, double b, int requested, in
       for (int m = 0; m <= degree; ++m)
         moments[m] = cadd(moments[m], cmul(coefficient, linear[2 * k + m]));
     }
+    // The last term's coefficient over the order it would have reached.
+    if constexpr (Extra > 0) {
+      RI_ANALYTIC_UNROLL
+      for (int n = 0; n <= degree - Extra; ++n)
+        tail[n] = cmul(coefficient, linear[2 * terms + n]);
+    }
   }
 }
 
@@ -257,32 +272,63 @@ RI_ANALYTIC_INLINE void analytic_quadratic(double a, double b, int requested, in
 // sum as the reference, and lets the transpose reuse exactly the forward map.
 // Default settings have fixed small bounds so CUDA can scalarise the arrays;
 // the bounded general path accommodates wider stencils and convergence sweeps.
-template <bool Default, typename W>
+//
+// With Extra = kAnalyticDelayOrders - 1, return instead the derivatives of
+// the weights in phi, a, b and c, each over i, as kAnalyticDelayOrders rows
+// of AnalyticStorage<Default>::product; the first row is the weights
+// themselves. H_m integrates x^m exp(i (phi + a x + b x^2 + c x^3)), so its
+// derivatives are H_m, H_m+1, H_m+2 and H_m+3 -- exactly, for the weights as
+// computed, in phi and a. The curvature and cubic series are each one term
+// short in their own coefficient, so the rows for b and c subtract what the
+// truncation leaves out: for a segment's moments M, the series' tail T (see
+// analytic_quadratic) and the cubic's last coefficient g,
+//   dE_j/db' = i (E_j+2 - D_j),  D_j = sum_k g_k T_3k+j
+//   dE_j/dc' = i (E_j+3 - G_j),  G_j = g_last M_3n+j
+// with b' = (b + 3c centre) r^2 and c' = c r^3, translated like the weights.
+// That keeps the derivative the derivative of the value, not of the integral
+// it approximates.
+template <bool Default, typename W, int Extra = 0>
 RI_ANALYTIC_INLINE void analytic_weights(int count, int segments, int terms, int cubic_terms,
                                       double a, double b, double c, double phi,
                                       Cplx<W> *weights) {
-  using Storage = AnalyticStorage<Default>;
+  using Storage = AnalyticStorage<Default, Extra>;
+  constexpr bool Delay = Extra > 0;
+  static_assert(!Delay || Extra == kAnalyticDelayOrders - 1);
+  constexpr int stride = Storage::product;
   assert(analytic_configuration_fits(count, {segments, terms, cubic_terms}));
   assert(!Default || analytic_is_default(count, {segments, terms, cubic_terms}));
-  const auto sizes = Default ? analytic_sizes(Storage::coefficients, Storage::terms, Storage::cubic_terms)
-                             : analytic_sizes(count, terms, cubic_terms);
-  const int degree = sizes.product - 1, nk = sizes.cubic_terms;
+  const auto sizes = Default ? analytic_sizes(Storage::coefficients, Storage::terms, Storage::cubic_terms, Extra)
+                             : analytic_sizes(count, terms, cubic_terms, Extra);
+  const int degree = sizes.weights - 1, base = sizes.product - 1, nk = sizes.cubic_terms;
   const int md = sizes.moments - 1, nt = Default ? Storage::terms : terms;
-  assert(sizes.product <= Storage::product && sizes.moments <= Storage::moments &&
+  assert(sizes.weights <= Storage::weights && sizes.moments <= Storage::moments &&
          sizes.linear <= Storage::linear);
   const double radius = 1. / segments;
+  // The value's weights go straight to the caller. The delay's three further
+  // orders and its two corrections, one row each, are gathered here first.
+  Cplx<W> extended[Delay ? Storage::weights : 1], fix[Delay ? 2 * stride : 1];
+  Cplx<W> *h = Delay ? extended : weights;
   RI_ANALYTIC_UNROLL
-  for (int m = 0; m <= degree; ++m) weights[m] = {0, 0};
+  for (int m = 0; m <= degree; ++m) h[m] = {0, 0};
+  if constexpr (Delay) {
+    RI_ANALYTIC_UNROLL
+    for (int m = 0; m <= base; ++m) fix[m] = fix[stride + m] = {0, 0};
+  }
   for (int i = 0; i < segments; ++i) {
     const double centre = -1 + (2 * i + 1) * radius;
     const W cw = W(centre), rw = W(radius), cube = W(c * radius * radius * radius);
-    Cplx<W> moments[Storage::moments], effective[Storage::product];
-    analytic_quadratic<Default, W>(
+    Cplx<W> moments[Storage::moments], effective[Storage::weights];
+    Cplx<W> tail[Delay ? Storage::moments : 1], miss_b[Delay ? stride : 1], miss_c[Delay ? stride : 1];
+    analytic_quadratic<Default, W, Extra>(
         (a + 2 * b * centre + 3 * c * centre * centre) * radius,
-        (b + 3 * c * centre) * radius * radius, md, nt, moments);
+        (b + 3 * c * centre) * radius * radius, md, nt, moments, Delay ? tail : nullptr);
     // As in the curvature sum above, the zeroth cubic term is the identity.
     RI_ANALYTIC_UNROLL
     for (int j = 0; j <= degree; ++j) effective[j] = moments[j];
+    if constexpr (Delay) {
+      RI_ANALYTIC_UNROLL
+      for (int j = 0; j <= base; ++j) miss_b[j] = tail[j];
+    }
     Cplx<W> coefficient{1, 0};
     RI_ANALYTIC_UNROLL
     for (int k = 1; k < nk; ++k) {
@@ -290,6 +336,14 @@ RI_ANALYTIC_INLINE void analytic_weights(int count, int segments, int terms, int
       RI_ANALYTIC_UNROLL
       for (int j = 0; j <= degree; ++j)
         effective[j] = cadd(effective[j], cmul(coefficient, moments[3 * k + j]));
+      if constexpr (Delay) {
+        RI_ANALYTIC_UNROLL
+        for (int j = 0; j <= base; ++j) miss_b[j] = cadd(miss_b[j], cmul(coefficient, tail[3 * k + j]));
+      }
+    }
+    if constexpr (Delay) {
+      RI_ANALYTIC_UNROLL
+      for (int j = 0; j <= base; ++j) miss_c[j] = cmul(coefficient, moments[3 * nk + j]);
     }
     const auto e = cscale(rw, analytic_exp<W>(phi + a * centre + b * centre * centre +
                                               c * centre * centre * centre));
@@ -297,7 +351,7 @@ RI_ANALYTIC_INLINE void analytic_weights(int count, int segments, int terms, int
     // walked once per segment rather than rebuilt inside the double sum: the
     // radius one belongs to j alone, so it folds into the moment it scales,
     // and the centre one is a running product.
-    W shift[Storage::product];
+    W shift[Storage::weights];
     shift[0] = 1;
     RI_ANALYTIC_UNROLL
     for (int k = 1; k <= degree; ++k) shift[k] = shift[k - 1] * cw;
@@ -305,15 +359,47 @@ RI_ANALYTIC_INLINE void analytic_weights(int count, int segments, int terms, int
     RI_ANALYTIC_UNROLL
     for (int j = 0; j <= degree; ++j) {
       effective[j] = cscale(span, effective[j]);
+      // The corrections to the b and c rows: b reaches the segment's moments
+      // through b' alone, c through b' and c'.
+      if constexpr (Delay) {
+        if (j <= base) {
+          const W r2 = span * rw * rw;
+          miss_c[j] = cadd(cscale(3 * cw * r2, miss_b[j]), cscale(r2 * rw, miss_c[j]));
+          miss_b[j] = cscale(r2, miss_b[j]);
+        }
+      }
       span *= rw;
     }
     RI_ANALYTIC_UNROLL
     for (int m = 0; m <= degree; ++m) {
-      Cplx<W> z{0, 0};
+      Cplx<W> z{0, 0}, zb{0, 0}, zc{0, 0};
       RI_ANALYTIC_UNROLL
-      for (int j = 0; j <= m; ++j)
-        z = cadd(z, cscale(W(analytic_binomial(m, j)) * shift[m - j], effective[j]));
-      weights[m] = cadd(weights[m], cmul(e, z));
+      for (int j = 0; j <= m; ++j) {
+        const W binomial = W(analytic_binomial<Storage::weights>(m, j)) * shift[m - j];
+        z = cadd(z, cscale(binomial, effective[j]));
+        if constexpr (Delay) {
+          if (m <= base) {
+            zb = cadd(zb, cscale(binomial, miss_b[j]));
+            zc = cadd(zc, cscale(binomial, miss_c[j]));
+          }
+        }
+      }
+      h[m] = cadd(h[m], cmul(e, z));
+      if constexpr (Delay) {
+        if (m <= base) {
+          fix[m] = cadd(fix[m], cmul(e, zb));
+          fix[stride + m] = cadd(fix[stride + m], cmul(e, zc));
+        }
+      }
+    }
+  }
+  if constexpr (Delay) {
+    RI_ANALYTIC_UNROLL
+    for (int m = 0; m <= base; ++m) {
+      weights[m] = h[m];
+      weights[stride + m] = h[m + 1];
+      weights[2 * stride + m] = cadd(h[m + 2], cscale(W(-1), fix[m]));
+      weights[3 * stride + m] = cadd(h[m + 3], cscale(W(-1), fix[stride + m]));
     }
   }
 }
