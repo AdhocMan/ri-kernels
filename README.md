@@ -116,17 +116,18 @@ kernels work through a tile pair per block; each `(a1, a2)` baseline may
 appear at most once.
 
 `amp` and `phase` are differentiated; `delay_us`, `int_time` and the tables
-are constants whose gradients `eval` stops. Two kernel pairs carry the
-derivatives: a JVP and transpose for the signal alone,
-and a full pair that takes the phase tangent as well and returns its
-cotangent. The phase enters every cell's weights as the one factor
+are constants whose gradients `eval` stops. Two JVP kernels carry the
+tangents, one for the signal alone and a full one that takes the phase
+tangent as well; one transpose kernel serves both and always returns the
+phase cotangent with the signal's. The phase enters every cell's weights as the one factor
 `exp(i (phase[a1] - phase[a2]))`, so the phase tangent turns the pair's
 product by `i` (`dV = i (dphase[a1] - dphase[a2]) V` per source and fine
 channel) and the cotangent is `-Im(g V)` on `a1` and `+Im(g V)` on `a2`,
 summed over the baseline's sources and fine channels; both cost one extra
 contraction against weights the kernel has already formed. The JVP rule binds
-the signal-only pair whenever the phase tangent is a symbolic zero, so a
-fixed orbit computes no phase derivative. The compiled JVPs and transposes
+the signal-only JVP whenever the phase tangent is a symbolic zero, so a fixed
+orbit's forward mode computes no phase derivative; its VJP still computes the
+phase cotangent and drops it. The compiled JVPs and transposes
 follow JAX's complex cotangent convention.
 
 The moment branches, segmentation and cubic translation follow

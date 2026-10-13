@@ -10,7 +10,7 @@ import pytest
 from analytic_reference import analytic_rfi_vis
 from ri_kernels.jax_api.rfi_analytic_vis_op import (
     RFIAnalyticVisOp, _TAB_LIB_ANALYTIC, _TAB_LIB_ANALYTIC_GPU,
-    rfi_analytic_vis_op, rfi_analytic_jvp_op, rfi_analytic_transpose_op,
+    rfi_analytic_vis_op, rfi_analytic_jvp_op,
     rfi_analytic_full_jvp_op, rfi_analytic_full_transpose_op,
 )
 
@@ -356,15 +356,14 @@ def test_constants_and_zero_tangent(precision, device):
     np.testing.assert_array_equal(dot, jnp.zeros_like(value))
 
 
-def test_the_signal_only_kernels_serve_a_fixed_phase():
-    """A fixed phase binds the signal-only JVP and transpose; a differentiated
-    phase binds the full pair."""
+def test_the_signal_only_jvp_serves_a_fixed_phase():
+    """A fixed phase binds the signal-only JVP, a differentiated phase the
+    full JVP; every VJP binds the one transpose."""
     args = make_inputs(jnp.float32, jnp.complex64)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
     cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=jnp.complex64)
-    names = ("rfi_analytic_jvp_op", "rfi_analytic_transpose_op",
-             "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
+    names = ("rfi_analytic_jvp_op", "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
 
     def primitives(fn, *primals):
         _, pullback = jax.vjp(fn, *primals)
@@ -372,9 +371,9 @@ def test_the_signal_only_kernels_serve_a_fixed_phase():
         return {name for name in names if name in text}
 
     used = primitives(lambda a: op.eval(a, *args[1:]), args[0])
-    assert "rfi_analytic_transpose_op" in used and "rfi_analytic_full_transpose_op" not in used
+    assert "rfi_analytic_full_transpose_op" in used
     used = primitives(lambda a, p: op.eval(a, p, *args[2:]), args[0], args[1])
-    assert "rfi_analytic_full_transpose_op" in used and "rfi_analytic_transpose_op" not in used
+    assert "rfi_analytic_full_transpose_op" in used
     used = primitives(lambda p: op.eval(args[0], p, *args[2:]), args[1])
     assert "rfi_analytic_full_transpose_op" in used
     # Forward mode likewise.
@@ -427,8 +426,6 @@ def test_direct_bind_derivatives_and_shapes():
                 (args[2],), (jnp.ones_like(args[2]),))
     with pytest.raises(ValueError, match="signal tangent"):
         rfi_analytic_jvp_op.bind(*op.indices, args[0], args[0][:-1], *args[1:], **options)
-    with pytest.raises(ValueError, match="visibility cotangent"):
-        rfi_analytic_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128), **options)
     with pytest.raises(ValueError, match="phase tangent"):
         rfi_analytic_full_jvp_op.bind(*op.indices, args[0], args[0], args[1], args[1][:-1], *args[2:], **options)
     with pytest.raises(ValueError, match="visibility cotangent"):

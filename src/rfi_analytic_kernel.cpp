@@ -46,11 +46,11 @@ void analytic_cpu_cells(std::int64_t begin, std::int64_t end,
   }
 }
 
-// Phase adds the phase's cotangent: for V = exp(i (phase_p - phase_q)) K the
-// pair's product z gives phase_bar_p -= Im(g z) and phase_bar_q += Im(g z),
+// The signal's cotangent and the phase's: for V = exp(i (phase_p - phase_q)) K
+// the pair's product z gives phase_bar_p -= Im(g z) and phase_bar_q += Im(g z),
 // JAX's real cotangent Re(g dV/dphase). The task owns a source, so the
 // per-antenna sums need no atomics either.
-template <bool Default, bool Phase, typename T>
+template <bool Default, typename T>
 void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
     AnalyticViews<T> v, Tensor3D<const Cplx<T> *> cot, Tensor4D<Cplx<T> *> out,
     Tensor4D<T *> phase_bar) {
@@ -62,7 +62,7 @@ void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
       for (std::int64_t f = 0; f < nf; ++f)
         for (std::int64_t t = 0; t < nt; ++t) {
           out(ant, r, f, t) = {0, 0};
-          if constexpr (Phase) phase_bar(ant, r, f, t) = 0;
+          phase_bar(ant, r, f, t) = 0;
         }
     for (std::int64_t f = 0; f < nf; ++f) {
       for (std::int64_t t = 0; t < nt; ++t) {
@@ -77,14 +77,12 @@ void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
             Cplx<double> h[AnalyticStorage<Default>::product];
             analytic_pair_weights<Default, double>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
             const auto g = cscale(T(1) / T(nu), cot(bl, f, t));
-            if constexpr (Phase) {
-              const auto z = analytic_contract<Default, double>(coefficients.data() + p,
-                  coefficients.data() + q, coefficients.data() + p, coefficients.data() + q, h,
-                  int(nm), na, false);
-              const auto s = cmul(g, z);
-              phase_bar(p, r, f, t) -= s.im;
-              phase_bar(q, r, f, t) += s.im;
-            }
+            const auto z = analytic_contract<Default, double>(coefficients.data() + p,
+                coefficients.data() + q, coefficients.data() + p, coefficients.data() + q, h,
+                int(nm), na, false);
+            const auto s = cmul(g, z);
+            phase_bar(p, r, f, t) -= s.im;
+            phase_bar(q, r, f, t) += s.im;
             for (std::int64_t j = 0; j < nm; ++j)
               for (std::int64_t k = 0; k < nm; ++k) {
                 const auto w = cmul(g, analytic_cast<T, double>(h[j + k]));
@@ -116,10 +114,10 @@ ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt, analytic_index_t st,
     ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
-    ffi::Buffer<A, 3> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 4 : 3>> out,
+    ffi::Buffer<A, 3> cot, ffi::Result<ffi::Buffer<A, Mode == 3 ? 4 : 3>> out,
     ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms, std::int64_t) {
-  constexpr bool Transpose = Mode == 2 || Mode == 4, Phase = Mode >= 3;
+  constexpr bool Transpose = Mode == 3, Phase = Mode >= 2;
   const AnalyticOptions options{segments, terms, cubic_terms};
   auto status = analytic_validate(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
                                  wf, sf, gt, st, dnu, duration, freq, options, true);
@@ -132,20 +130,20 @@ ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
     if (!analytic_same_shape(amp, *out) || cot.dimensions()[0] != a1.element_count() ||
         cot.dimensions()[1] != a[2] || cot.dimensions()[2] != a[3])
       return completed_future(ffi::Error::InvalidArgument("Invalid analytic transpose output or cotangent shape"));
-    if (Phase && !analytic_same_shape(phase, **phase_bar))
+    if (!analytic_same_shape(phase, **phase_bar))
       return completed_future(ffi::Error::InvalidArgument("Expected the phase cotangent to match the phase"));
     Tensor4D<Cplx<T> *> output(reinterpret_cast<Cplx<T> *>(out->typed_data()), a[0], a[1], a[2], a[3]);
-    Tensor4D<T *> pb(Phase ? (*phase_bar)->typed_data() : nullptr, a[0], a[1], a[2], a[3]);
+    Tensor4D<T *> pb((*phase_bar)->typed_data(), a[0], a[1], a[2], a[3]);
     Tensor3D<const Cplx<T> *> g(reinterpret_cast<const Cplx<T> *>(cot.typed_data()), a1.element_count(), a[2], a[3]);
     return parallel_for(pool, a[1], [v, output, pb, g, defaults](auto b, auto e) {
-      if (defaults) analytic_cpu_transpose<true, Phase>(b, e, v, g, output, pb);
-      else analytic_cpu_transpose<false, Phase>(b, e, v, g, output, pb);
+      if (defaults) analytic_cpu_transpose<true>(b, e, v, g, output, pb);
+      else analytic_cpu_transpose<false>(b, e, v, g, output, pb);
     });
   } else {
     if (out->dimensions()[0] != a1.element_count() || out->dimensions()[1] != a[2] || out->dimensions()[2] != a[3])
       return completed_future(ffi::Error::InvalidArgument("Invalid analytic visibility output shape"));
     Tensor3D<Cplx<T> *> output(reinterpret_cast<Cplx<T> *>(out->typed_data()), a1.element_count(), a[2], a[3]);
-    constexpr bool JVP = Mode == 1 || Mode == 3;
+    constexpr bool JVP = Mode == 1 || Mode == 2;
     return parallel_for(pool, a[2] * a[3], [v, output, defaults](auto b, auto e) {
       if (defaults) analytic_cpu_cells<true, JVP, Phase>(b, e, v, output);
       else analytic_cpu_cells<false, JVP, Phase>(b, e, v, output);

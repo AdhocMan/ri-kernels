@@ -4,10 +4,12 @@ The signal and the phase are differentiated. The phase enters every cell's
 weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so its tangent
 turns the pair's product by ``i`` and its cotangent is ``-Im(g V)`` on ``a1``
 and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. Two
-kernel pairs carry the derivatives: the signal alone, and the signal with the
+JVP kernels carry the tangents: the signal alone, and the signal with the
 phase; the JVP rule binds the first whenever the phase tangent is a symbolic
-zero. The delay, the integration interval and
-the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops their gradients.
+zero. One transpose kernel serves both and always returns the phase
+cotangent with the signal's; the signal-only JVP drops it. The delay, the
+integration interval and the tables are constants:
+:meth:`RFIAnalyticVisOp.eval` stops their gradients.
 """
 
 from functools import partial
@@ -165,7 +167,7 @@ class RFIAnalyticVisOp:
         )
 
 
-_ANALYTIC_PASSES = ("fwd", "jvp", "transpose", "full_jvp", "full_transpose")
+_ANALYTIC_PASSES = ("fwd", "jvp", "full_jvp", "full_transpose")
 
 
 def _has_analytic(lib, platform):
@@ -304,26 +306,9 @@ def _lowering(pass_, platform):
     return lowering
 
 
-# --- transpose: the cotangent of the signal from the cotangent of the visibilities
+# --- transpose: the cotangents of the signal and the phase from that of the
+# visibilities. Every VJP takes both; the signal-only JVP drops the phase.
 
-rfi_analytic_transpose_op = core.Primitive("rfi_analytic_transpose_op")
-rfi_analytic_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analytic_transpose_op))
-
-
-def _transpose_abstract(*args, **options):
-    _validate_options(**options)
-    a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
-    _validate(*arrays)
-    _validate_indices(args)
-    _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
-    return ShapedArray(arrays[0].shape, arrays[0].dtype)
-
-
-rfi_analytic_transpose_op.def_abstract_eval(_transpose_abstract)
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "gpu"), platform="gpu")
-
-# The full transpose: the cotangents of the signal and the phase.
 rfi_analytic_full_transpose_op = core.Primitive("rfi_analytic_full_transpose_op")
 rfi_analytic_full_transpose_op.multiple_results = True
 rfi_analytic_full_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full_transpose_op))
@@ -378,9 +363,9 @@ mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "gpu"), platfor
 
 def _jvp_transpose(g, *args, **options):
     indices, amp, rest = args[:N_IDX], args[N_IDX], args[N_IDX + 2:]
-    amp_bar = rfi_analytic_transpose_op.bind(*indices, amp, *rest, g, **options)
-    # One cotangent, for the linear input amp_dot; every other input is a
-    # constant of the linear map.
+    amp_bar, _ = rfi_analytic_full_transpose_op.bind(*indices, amp, *rest, g, **options)
+    # One cotangent, for the linear input amp_dot; every other input, the
+    # phase among them, is a constant of the linear map.
     return (None,) * N_IDX + (None, amp_bar) + (None,) * len(rest)
 
 
@@ -458,7 +443,7 @@ def _vis_jvp(args, tangents, **options):
             )
     primal = rfi_analytic_vis_op.bind(*args, **options)
     if isinstance(phase_dot, ad.Zero):
-        # Nothing learnable feeds the phase: the signal-only kernels.
+        # Nothing learnable feeds the phase: the signal-only JVP.
         if isinstance(amp_dot, ad.Zero):
             return primal, ad.Zero.from_primal_value(primal)
         return primal, rfi_analytic_jvp_op.bind(*indices, amp, amp_dot, phase, *rest, **options)
