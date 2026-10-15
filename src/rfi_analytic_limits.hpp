@@ -18,25 +18,35 @@ constexpr int kAnalyticMaxCoefficients = 9;
 constexpr AnalyticOptions kAnalyticMaxOptions{1024, 32, 8};
 
 struct AnalyticSizes {
-  int coefficients, cubic_terms, product, moments, linear;
+  int coefficients, cubic_terms, product, weights, moments, linear;
 };
 
-TAB_H_D constexpr AnalyticSizes analytic_sizes(int coefficients, int terms, int cubic_terms) {
+// The delay derivatives are the weights of three higher orders (see
+// analytic_weights): a pass that forms them carries kAnalyticDelayOrders - 1
+// more weights, and with them more moments, than the product needs.
+constexpr int kAnalyticDelayOrders = 4;
+
+TAB_H_D constexpr AnalyticSizes analytic_sizes(int coefficients, int terms, int cubic_terms,
+                                               int extra = 0) {
   // Convolution doubles the amplitude degree. Each retained cubic term adds
   // three powers, then each curvature term adds two. Disabling cubic phase
   // still retains its zeroth term, so it cannot reduce the product capacity.
   const int nc = cubic_terms > 0 ? cubic_terms : 1;
   const int product = 2 * (coefficients - 1) + 1;
-  const int moments = product + 3 * (nc - 1);
-  return {coefficients, nc, product, moments, moments + 2 * (terms - 1)};
+  const int weights = product + extra;
+  const int moments = weights + 3 * (nc - 1);
+  return {coefficients, nc, product, weights, moments, moments + 2 * (terms - 1)};
 }
 
-template <bool Default> struct AnalyticStorage {
+// Extra is the number of weight orders past the product's: zero for the
+// value, kAnalyticDelayOrders - 1 for a pass that differentiates the delay.
+template <bool Default, int Extra = 0> struct AnalyticStorage {
   static constexpr int coefficients = Default ? kAnalyticDefaultCoefficients : kAnalyticMaxCoefficients;
   static constexpr int terms = Default ? kAnalyticDefaultOptions.terms : kAnalyticMaxOptions.terms;
   static constexpr int cubic_terms = Default ? kAnalyticDefaultOptions.cubic_terms : kAnalyticMaxOptions.cubic_terms;
-  static constexpr auto sizes = analytic_sizes(coefficients, terms, cubic_terms);
+  static constexpr auto sizes = analytic_sizes(coefficients, terms, cubic_terms, Extra);
   static constexpr int product = sizes.product;
+  static constexpr int weights = sizes.weights;
   static constexpr int moments = sizes.moments;
   static constexpr int linear = sizes.linear;
 
@@ -44,7 +54,7 @@ template <bool Default> struct AnalyticStorage {
   // and curvature contraction respectively. The tail of the downward
   // recurrence is a scalar and never extends the stored linear moments.
   static_assert(2 * (coefficients - 1) == product - 1);
-  static_assert((product - 1) + 3 * (sizes.cubic_terms - 1) == moments - 1);
+  static_assert((weights - 1) + 3 * (sizes.cubic_terms - 1) == moments - 1);
   static_assert((moments - 1) + 2 * (terms - 1) == linear - 1);
 };
 
@@ -64,9 +74,12 @@ TAB_H_D constexpr bool analytic_configuration_fits(std::int64_t coefficients, An
       options.terms < 1 || options.terms > kAnalyticMaxOptions.terms ||
       options.cubic_terms < 0 || options.cubic_terms > kAnalyticMaxOptions.cubic_terms)
     return false;
-  const auto need = analytic_sizes(int(coefficients), int(options.terms), int(options.cubic_terms));
-  using Capacity = AnalyticStorage<false>;
-  return need.product <= Capacity::product && need.moments <= Capacity::moments &&
+  // The derivative passes need the larger of the two; the sizes grow with the
+  // configuration, so a configuration that fits it fits the value's too.
+  const auto need = analytic_sizes(int(coefficients), int(options.terms), int(options.cubic_terms),
+                                   kAnalyticDelayOrders - 1);
+  using Capacity = AnalyticStorage<false, kAnalyticDelayOrders - 1>;
+  return need.weights <= Capacity::weights && need.moments <= Capacity::moments &&
          need.linear <= Capacity::linear;
 }
 

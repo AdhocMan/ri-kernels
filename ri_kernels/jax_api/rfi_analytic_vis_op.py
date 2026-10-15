@@ -1,13 +1,25 @@
 """Compiled analytic RFI visibility and its JVPs and transposes.
 
-The signal and the phase are differentiated. The phase enters every cell's
-weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so its tangent
-turns the pair's product by ``i`` and its cotangent is ``-Im(g V)`` on ``a1``
-and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. Two
-kernel pairs carry the derivatives: the signal alone, and the signal with the
-phase; the JVP rule binds the first whenever the phase tangent is a symbolic
-zero. The delay, the integration interval and
-the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops their gradients.
+The signal, the phase and the delay are differentiated. The phase enters
+every cell's weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so
+its tangent turns the pair's product by ``i`` and its cotangent is
+``-Im(g V)`` on ``a1`` and ``+Im(g V)`` on ``a2``, summed over the sources and
+fine channels. The delay's orders move the angles of the closed form (the
+centre phase, the winding, the curvature and the cubic), and the weights'
+derivative in each is the weights of a higher order, so the delay's derivative
+is the pair's product against those, turned by ``i`` the same way. Two JVP
+kernels carry the tangents: the signal alone, and the signal with the phase
+and the delay; the JVP rule binds the first whenever the phase and delay
+tangents are symbolic zeros. One transpose kernel serves both and always
+returns the phase cotangent with the signal's; the signal-only JVP drops it.
+The delay's derivative needs three further weight orders, so the full JVP and
+the transpose form it only under their static ``delay_grad``, which the JVP
+rule sets when the delay tangent is not a symbolic zero. The transpose rule
+clears it when that tangent is a constant of the transposed map, and the
+transpose's dead-code elimination rule clears it when the delay cotangent is
+unused. The integration
+interval and the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops
+their gradients.
 """
 
 from functools import partial
@@ -17,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
-from jax.interpreters import ad, mlir, xla
+from jax.interpreters import ad, mlir, partial_eval as pe, xla
 
 from .rfi_vis_op import (
     _TAB_LIB,
@@ -81,9 +93,9 @@ def tile_pair_list(n_ant, a1, a2):
 class RFIAnalyticVisOp:
     """RFI visibility from amplitude coefficients and analytic phase moments.
 
-    amp and phase are differentiated; the delay, integration interval and
-    tables are constants. The recurrence has no time sample axis or Nyquist
-    floor.
+    amp, phase and the delay are differentiated; the integration interval
+    and tables are constants. The recurrence has no time sample axis or
+    Nyquist floor.
     """
 
     def __init__(self, n_ant, a1, a2):
@@ -130,8 +142,9 @@ class RFIAnalyticVisOp:
         amp and phase have shape (n_ant, n_rfi, n_freq, n_time); delay_us
         is (n_ant, n_rfi, n_time, n_path), with delay derivatives in us/s^k.
         phase holds the reduced centre phase, computed in float64 before
-        casting. Both are differentiated; delay_us and everything after it
-        are constants. freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
+        casting. All three are differentiated, the delay in the orders the
+        closed form carries (below); everything after delay_us is a constant.
+        freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
 
         g_time[t,l,m] holds monomial coefficients in x = 2*tau/int_time,
         including shifted edge stencils. w_freq[f,k,u] holds the interpolation
@@ -142,7 +155,10 @@ class RFIAnalyticVisOp:
 
         segments splits [-1,1] equally; terms controls the curvature series,
         cubic_terms the residual cubic series (zero drops cubic phase).
-        Derivatives above order three are omitted, as in analytic_rfi_vis.
+        Derivatives above order three are omitted, as in analytic_rfi_vis,
+        and get a zero gradient; with cubic_terms=0 so does the third. The
+        delay's gradient is that of the value as computed, series truncations
+        included.
         The defaults are the measured two-piece configuration; 4,16,3 gives
         the reference's more conservative configuration. Coefficient counts
         up to 9, terms up to 32 and cubic_terms up to 8 are supported.
@@ -158,14 +174,14 @@ class RFIAnalyticVisOp:
         stop = jax.lax.stop_gradient
         int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
         return rfi_analytic_vis_op.bind(
-            *self.indices, amp, phase, stop(delay_us), stop(w_freq),
+            *self.indices, amp, phase, delay_us, stop(w_freq),
             start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
             stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
             scratch_mb=scratch_mb,
         )
 
 
-_ANALYTIC_PASSES = ("fwd", "jvp", "transpose", "full_jvp", "full_transpose")
+_ANALYTIC_PASSES = ("fwd", "jvp", "full_jvp", "full_transpose")
 
 
 def _has_analytic(lib, platform):
@@ -286,7 +302,9 @@ def _validate_indices(args):
             raise ValueError(f"Expected int32 index array of shape {shape}; got {x.shape} {x.dtype}")
 
 
-def _validate_options(*, segments, terms, cubic_terms, scratch_mb):
+def _validate_options(*, segments, terms, cubic_terms, scratch_mb, delay_grad=False):
+    if not isinstance(delay_grad, (bool, np.bool_)):
+        raise ValueError("delay_grad must be a static bool")
     for name, value, lo, hi in (("segments", segments, 1, 1024),
                                ("terms", terms, 1, 32), ("cubic_terms", cubic_terms, 0, 8),
                                ("scratch_mb", scratch_mb, 1, _MAX_SCRATCH_MB)):
@@ -304,26 +322,10 @@ def _lowering(pass_, platform):
     return lowering
 
 
-# --- transpose: the cotangent of the signal from the cotangent of the visibilities
+# --- transpose: the cotangents of the signal, the phase and the delay from that
+# of the visibilities. Every VJP takes the first two; the signal-only JVP drops
+# the phase. The delay's is zero unless delay_grad.
 
-rfi_analytic_transpose_op = core.Primitive("rfi_analytic_transpose_op")
-rfi_analytic_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analytic_transpose_op))
-
-
-def _transpose_abstract(*args, **options):
-    _validate_options(**options)
-    a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
-    _validate(*arrays)
-    _validate_indices(args)
-    _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
-    return ShapedArray(arrays[0].shape, arrays[0].dtype)
-
-
-rfi_analytic_transpose_op.def_abstract_eval(_transpose_abstract)
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_transpose_op, _lowering("transpose", "gpu"), platform="gpu")
-
-# The full transpose: the cotangents of the signal and the phase.
 rfi_analytic_full_transpose_op = core.Primitive("rfi_analytic_full_transpose_op")
 rfi_analytic_full_transpose_op.multiple_results = True
 rfi_analytic_full_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full_transpose_op))
@@ -335,11 +337,26 @@ def _full_transpose_abstract(*args, **options):
     _validate(*arrays)
     _validate_indices(args)
     _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
-    amp, phase = arrays[:2]
-    return (ShapedArray(amp.shape, amp.dtype), ShapedArray(phase.shape, phase.dtype))
+    amp, phase, delay = arrays[:3]
+    return (ShapedArray(amp.shape, amp.dtype), ShapedArray(phase.shape, phase.dtype),
+            ShapedArray(delay.shape, delay.dtype))
 
 
 rfi_analytic_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
+
+
+def _full_transpose_dce(used_outputs, eqn):
+    # Dead-code elimination (jit runs it before lowering): drop the delay's
+    # cotangent when nothing reads it, as when only the signal's and the
+    # phase's gradients are kept.
+    if not any(used_outputs):
+        return [False] * len(eqn.invars), None
+    if eqn.params["delay_grad"] and not used_outputs[2]:
+        eqn = eqn.replace(params={**eqn.params, "delay_grad": False})
+    return [True] * len(eqn.invars), eqn
+
+
+pe.dce_rules[rfi_analytic_full_transpose_op] = _full_transpose_dce
 mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "cpu"), platform="cpu")
 mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "gpu"), platform="gpu")
 
@@ -378,17 +395,20 @@ mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "gpu"), platfor
 
 def _jvp_transpose(g, *args, **options):
     indices, amp, rest = args[:N_IDX], args[N_IDX], args[N_IDX + 2:]
-    amp_bar = rfi_analytic_transpose_op.bind(*indices, amp, *rest, g, **options)
-    # One cotangent, for the linear input amp_dot; every other input is a
-    # constant of the linear map.
+    amp_bar, _, _ = rfi_analytic_full_transpose_op.bind(
+        *indices, amp, *rest, g, delay_grad=False, **options
+    )
+    # One cotangent, for the linear input amp_dot; every other input, the
+    # phase among them, is a constant of the linear map.
     return (None,) * N_IDX + (None, amp_bar) + (None,) * len(rest)
 
 
 ad.primitive_transposes[rfi_analytic_jvp_op] = _jvp_transpose
 
 
-# --- full JVP: linear in the signal and phase tangents --------------------------
-# Arguments: *indices, amp, amp_dot, phase, phase_dot, delay, tables.
+# --- full JVP: linear in the signal, phase and delay tangents -------------------
+# Arguments: *indices, amp, amp_dot, phase, phase_dot, delay, delay_dot, tables.
+# Without delay_grad the delay tangent is ignored.
 
 rfi_analytic_full_jvp_op = core.Primitive("rfi_analytic_full_jvp_op")
 rfi_analytic_full_jvp_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full_jvp_op))
@@ -397,12 +417,13 @@ rfi_analytic_full_jvp_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full
 def _full_jvp_abstract(*args, **options):
     _validate_options(**options)
     a1 = args[0]
-    amp, amp_dot, phase, phase_dot, delay = args[N_IDX:N_IDX + 5]
-    tables = args[N_IDX + 5:]
+    amp, amp_dot, phase, phase_dot, delay, delay_dot = args[N_IDX:N_IDX + 6]
+    tables = args[N_IDX + 6:]
     _validate(amp, phase, delay, *tables)
     _validate_indices(args)
     _validate_like("signal tangent", amp, amp_dot)
     _validate_like("phase tangent", phase, phase_dot)
+    _validate_like("delay tangent", delay, delay_dot)
     return _output_aval(a1, amp)
 
 
@@ -413,13 +434,18 @@ mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "gpu"
 
 def _full_jvp_transpose(g, *args, **options):
     indices = args[:N_IDX]
-    amp, _, phase, _, delay = args[N_IDX:N_IDX + 5]
-    tables = args[N_IDX + 5:]
-    amp_bar, phase_bar = rfi_analytic_full_transpose_op.bind(
-        *indices, amp, phase, delay, *tables, g, **options
+    amp, _, phase, _, delay, delay_dot = args[N_IDX:N_IDX + 6]
+    tables = args[N_IDX + 6:]
+    # The delay's cotangent is wanted only when its tangent is a linear input
+    # of the map being transposed; a known tangent is a constant of it.
+    delay_grad = options.pop("delay_grad") and ad.is_undefined_primal(delay_dot)
+    amp_bar, phase_bar, delay_bar = rfi_analytic_full_transpose_op.bind(
+        *indices, amp, phase, delay, *tables, g, delay_grad=delay_grad, **options
     )
-    # Cotangents for the two linear inputs, at their tangent slots.
-    return (None,) * N_IDX + (None, amp_bar, None, phase_bar, None) + (None,) * len(tables)
+    # Cotangents for the linear inputs, at their tangent slots.
+    delay_bar = delay_bar if delay_grad else None
+    return ((None,) * N_IDX + (None, amp_bar, None, phase_bar, None, delay_bar)
+            + (None,) * len(tables))
 
 
 ad.primitive_transposes[rfi_analytic_full_jvp_op] = _full_jvp_transpose
@@ -446,26 +472,33 @@ mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", "gpu"), platform="g
 
 def _vis_jvp(args, tangents, **options):
     indices, arrays = args[:N_IDX], args[N_IDX:]
-    amp, phase, rest = arrays[0], arrays[1], arrays[2:]
-    amp_dot, phase_dot = tangents[N_IDX], tangents[N_IDX + 1]
-    # eval() stops the gradient on the delay, the interval and the tables, so
-    # a tangent on them can only reach here through a direct bind. The kernels
-    # have no derivative with respect to them: refuse rather than drop.
-    for name, dot in zip(_ARRAY_NAMES[2:], tangents[N_IDX + 2:]):
+    amp, phase, delay, tables = arrays[0], arrays[1], arrays[2], arrays[3:]
+    amp_dot, phase_dot, delay_dot = tangents[N_IDX:N_IDX + 3]
+    # eval() stops the gradient on the interval and the tables, so a tangent
+    # on them can only reach here through a direct bind. The kernels have no
+    # derivative with respect to them: refuse rather than drop.
+    for name, dot in zip(_ARRAY_NAMES[3:], tangents[N_IDX + 3:]):
         if not isinstance(dot, ad.Zero):
             raise TypeError(
-                f"rfi_analytic_vis_op differentiates amp and phase only; got a tangent for {name}"
+                f"rfi_analytic_vis_op differentiates amp, phase and delay_us only; "
+                f"got a tangent for {name}"
             )
     primal = rfi_analytic_vis_op.bind(*args, **options)
-    if isinstance(phase_dot, ad.Zero):
-        # Nothing learnable feeds the phase: the signal-only kernels.
-        if isinstance(amp_dot, ad.Zero):
+    zero = lambda dot: isinstance(dot, ad.Zero)
+    if zero(phase_dot) and zero(delay_dot):
+        # Nothing learnable feeds the phase or the delay: the signal-only JVP.
+        if zero(amp_dot):
             return primal, ad.Zero.from_primal_value(primal)
-        return primal, rfi_analytic_jvp_op.bind(*indices, amp, amp_dot, phase, *rest, **options)
-    if isinstance(amp_dot, ad.Zero):
-        amp_dot = jnp.zeros_like(amp)
+        return primal, rfi_analytic_jvp_op.bind(*indices, amp, amp_dot, phase, delay, *tables, **options)
+    # The full JVP forms the delay's derivative only when it has a tangent.
+    delay_grad = not zero(delay_dot)
+    amp_dot, phase_dot, delay_dot = (
+        jnp.zeros_like(x) if zero(dot) else dot
+        for x, dot in ((amp, amp_dot), (phase, phase_dot), (delay, delay_dot))
+    )
     return primal, rfi_analytic_full_jvp_op.bind(
-        *indices, amp, amp_dot, phase, phase_dot, *rest, **options
+        *indices, amp, amp_dot, phase, phase_dot, delay, delay_dot, *tables,
+        delay_grad=delay_grad, **options
     )
 
 
