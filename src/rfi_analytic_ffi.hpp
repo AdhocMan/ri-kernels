@@ -2,8 +2,8 @@
 // scalar duration in the time-offset slot: the forward, the signal JVP, the
 // full JVP that carries the phase and delay tangents as well, and the
 // transpose that returns the signal, phase and delay cotangents. Options are
-// static FFI attributes; scratch_mb bounds the GPU coefficient scratch and the
-// CPU handlers ignore it. delay_grad, on the last two, says whether the delay
+// static FFI attributes; scratch_mb is the GPU coefficient scratch target,
+// exceeded only when one cell needs more, and the CPU handlers ignore it. delay_grad, on the last two, says whether the delay
 // is differentiated: without it the full JVP ignores the delay tangent and
 // the transpose writes a zero delay cotangent, and neither forms the further
 // weight orders the delay's derivative needs.

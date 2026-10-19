@@ -55,8 +55,8 @@ from .rfi_vis_op import (
 #: the two have to be changed together.
 TILE = 32
 
-#: The default bound, in MiB, on the GPU coefficient scratch; see ``scratch_mb``
-#: in :meth:`RFIAnalyticVisOp.eval`.
+#: The default target, in MiB, for the GPU coefficient scratch; see
+#: ``scratch_mb`` in :meth:`RFIAnalyticVisOp.eval`.
 SCRATCH_MB = 256
 
 # The largest scratch_mb whose byte count fits in int64.
@@ -175,11 +175,13 @@ class RFIAnalyticVisOp:
         the reference's more conservative configuration. Coefficient counts
         up to 9, terms up to 32 and cubic_terms up to 8 are supported.
 
-        scratch_mb bounds the GPU coefficient scratch in MiB; the CPU ignores
-        it. The GPU kernels chunk over time, and over frequency when one time
-        cell does not fit, so a smaller budget costs more launches and, in the
-        transposes, more passes over the cotangent. A budget below one cell and
-        channel fails at run time.
+        scratch_mb is the target size of the GPU coefficient scratch in MiB;
+        the CPU ignores it. The GPU kernels chunk over time, and over frequency
+        when one time cell does not fit, so a smaller budget costs more
+        launches and, in the transposes, more passes over the cotangent. When
+        even one channel of one cell does not fit beside the transpose's
+        frequency-complete phase and delay partials, the kernels take that
+        minimum instead, so scratch_mb is exceeded rather than failing.
         """
         _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms,
                           scratch_mb=scratch_mb)

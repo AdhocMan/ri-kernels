@@ -587,10 +587,11 @@ def test_gpu_scratch_chunks(real_name, device, pol):
     # This shape forces a frequency split at 1 MiB even for complex64. The
     # final chunks are short on both axes, and edge stencils cross chunks. One
     # cell of the complex128, P = 2 delay transpose, with its frequency-complete
-    # phase and delay partials, still fits.
+    # phase and delay partials, needs more than 1 MiB: the kernels raise the
+    # budget to that minimum rather than fail.
     real = getattr(jnp, real_name)
     complex_ = jnp.complex64 if real == jnp.float32 else jnp.complex128
-    args = make_inputs(real, complex_, pol=pol, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=7)
+    args = make_inputs(real, complex_, pol=pol, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=9)
     a1 = jnp.array([0, 64, 31, 32, 0, 32, 64], jnp.int32)
     a2 = jnp.array([64, 0, 32, 31, 0, 32, 64], jnp.int32)
     op = RFIAnalyticVisOp(65, a1, a2)

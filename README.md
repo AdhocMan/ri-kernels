@@ -205,8 +205,12 @@ six-term, three-cubic-term path has unrolled moment orders so its CUDA
 recurrence can stay in registers. Wider configurations use a bounded general
 implementation.
 
-GPU scratch is bounded by the `scratch_mb` argument of `eval` (256 MiB by
-default), with time chunks and, when necessary, frequency chunks. A smaller
+GPU scratch is sized to the `scratch_mb` argument of `eval` (256 MiB by
+default), with time chunks and, when necessary, frequency chunks. The scratch
+is allocated as the plan needs it, not reserved up front, and `scratch_mb` is
+a target rather than a hard limit: when even one channel of one cell does not
+fit beside the transpose's frequency-complete phase and delay partials, the
+kernels use that minimum instead of failing. A smaller
 budget means more chunks, and each chunk of a transpose passes over the whole
 signal cotangent. The transpose reduces coefficient cotangents within each tile
 in shared memory, writes separate partials for partner tiles, and gathers
