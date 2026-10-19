@@ -1,8 +1,12 @@
-// The five analytic handlers per precision share one operand order, with a
-// scalar duration in the time-offset slot: the forward, the
-// signal JVP and transpose, and the full JVP and transpose that carry the
-// phase tangent and cotangent as well. Options are static FFI attributes;
-// scratch_mb bounds the GPU coefficient scratch and the CPU handlers ignore it.
+// The four analytic handlers per precision share one operand order, with a
+// scalar duration in the time-offset slot: the forward, the signal JVP, the
+// full JVP that carries the phase and delay tangents as well, and the
+// transpose that returns the signal, phase and delay cotangents. Options are
+// static FFI attributes; scratch_mb bounds the GPU coefficient scratch and the
+// CPU handlers ignore it. delay_grad, on the last two, says whether the delay
+// is differentiated: without it the full JVP ignores the delay tangent and
+// the transpose writes a zero delay cotangent, and neither forms the further
+// weight orders the delay's derivative needs.
 // Included once by each platform with its execution context and dispatcher.
 #define RI_ANALYTIC_NAME_I(kind, platform, precision) ri_rfi_analytic_vis##kind##_##platform##_##precision
 #define RI_ANALYTIC_NAME_(kind, platform, precision) RI_ANALYTIC_NAME_I(kind, platform, precision)
@@ -35,8 +39,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f32)(
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<0, float, ffi::C64, ffi::F32>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, false);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_fwd, f32)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f32),
@@ -90,8 +95,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_jvp, f32)(
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<1, float, ffi::C64, ffi::F32>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, false);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_jvp, f32)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f32),
@@ -121,62 +127,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f32),
         .Attr<std::int64_t>("cubic_terms")
         .Attr<std::int64_t>("scratch_mb"));
 
-RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_transpose, f32)(
-    RI_ANALYTIC_CONTEXT,
-    analytic_index_t a1,
-    analytic_index_t a1_sorter,
-    analytic_index_t a1_start,
-    analytic_index_t a2,
-    analytic_index_t a2_sorter,
-    analytic_index_t a2_start,
-    ffi::BufferR2<ffi::S32> pair,
-    ffi::BufferR2<ffi::S32> tiles,
-    analytic_amp_f32_t amp,
-    analytic_real4_f32_t phase,
-    analytic_real4_f32_t delay,
-    analytic_real3_f32_t wf,
-    analytic_index_t sf,
-    analytic_real3_f32_t gt,
-    analytic_index_t st,
-    analytic_real1_f32_t dnu,
-    ffi::BufferR0<ffi::F32> duration,
-    analytic_real1_f32_t freq,
-    analytic_vis_f32_t cot,
-    ffi::Result<analytic_amp_f32_t> out,
-    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<2, float, ffi::C64, ffi::F32>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, cot, out, nullptr, segments, terms, cubic_terms, scratch_mb);
-}
-extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_transpose, f32)(XLA_FFI_CallFrame *);
-XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_transpose, f32),
-    RI_ANALYTIC_IMPL(_transpose, f32), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
-        .Arg<analytic_amp_f32_t>()
-        .Arg<analytic_real4_f32_t>()
-        .Arg<analytic_real4_f32_t>()
-        .Arg<analytic_real3_f32_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_real3_f32_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_real1_f32_t>()
-        .Arg<ffi::BufferR0<ffi::F32>>()
-        .Arg<analytic_real1_f32_t>()
-        .Arg<analytic_vis_f32_t>()
-        .Ret<analytic_amp_f32_t>()
-        .Attr<std::int64_t>("segments")
-        .Attr<std::int64_t>("terms")
-        .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
-
 RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f32)(
     RI_ANALYTIC_CONTEXT,
     analytic_index_t a1,
@@ -192,6 +142,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f32)(
     analytic_real4_f32_t phase,
     analytic_real4_f32_t phase_dot,
     analytic_real4_f32_t delay,
+    analytic_real4_f32_t delay_dot,
     analytic_real3_f32_t wf,
     analytic_index_t sf,
     analytic_real3_f32_t gt,
@@ -201,10 +152,11 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f32)(
     analytic_real1_f32_t freq,
     ffi::Result<analytic_vis_f32_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<3, float, ffi::C64, ffi::F32>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+    std::int64_t scratch_mb, std::int64_t delay_grad) {
+  return RI_ANALYTIC_DISPATCH<2, float, ffi::C64, ffi::F32>(
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay, delay_dot,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, delay_grad != 0);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_full_jvp, f32)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f32),
@@ -222,6 +174,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f32),
         .Arg<analytic_real4_f32_t>()
         .Arg<analytic_real4_f32_t>()
         .Arg<analytic_real4_f32_t>()
+        .Arg<analytic_real4_f32_t>()
         .Arg<analytic_real3_f32_t>()
         .Arg<analytic_index_t>()
         .Arg<analytic_real3_f32_t>()
@@ -233,7 +186,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f32),
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
+        .Attr<std::int64_t>("scratch_mb")
+        .Attr<std::int64_t>("delay_grad"));
 
 RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f32)(
     RI_ANALYTIC_CONTEXT,
@@ -258,11 +212,13 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f32)(
     analytic_vis_f32_t cot,
     ffi::Result<analytic_amp_f32_t> out,
     ffi::Result<ffi::BufferR4<ffi::F32>> phase_bar,
+    ffi::Result<ffi::BufferR4<ffi::F32>> delay_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<4, float, ffi::C64, ffi::F32>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, cot, out, &phase_bar, segments, terms, cubic_terms, scratch_mb);
+    std::int64_t scratch_mb, std::int64_t delay_grad) {
+  return RI_ANALYTIC_DISPATCH<3, float, ffi::C64, ffi::F32>(
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, cot, out, &phase_bar, &delay_bar, segments, terms,
+      cubic_terms, scratch_mb, delay_grad != 0);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_full_transpose, f32)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f32),
@@ -288,10 +244,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f32),
         .Arg<analytic_vis_f32_t>()
         .Ret<analytic_amp_f32_t>()
         .Ret<ffi::BufferR4<ffi::F32>>()
+        .Ret<ffi::BufferR4<ffi::F32>>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
+        .Attr<std::int64_t>("scratch_mb")
+        .Attr<std::int64_t>("delay_grad"));
 
 RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f64)(
     RI_ANALYTIC_CONTEXT,
@@ -317,8 +275,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f64)(
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<0, double, ffi::C128, ffi::F64>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, false);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_fwd, f64)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f64),
@@ -372,8 +331,9 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_jvp, f64)(
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<1, double, ffi::C128, ffi::F64>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, false);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_jvp, f64)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f64),
@@ -403,62 +363,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f64),
         .Attr<std::int64_t>("cubic_terms")
         .Attr<std::int64_t>("scratch_mb"));
 
-RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_transpose, f64)(
-    RI_ANALYTIC_CONTEXT,
-    analytic_index_t a1,
-    analytic_index_t a1_sorter,
-    analytic_index_t a1_start,
-    analytic_index_t a2,
-    analytic_index_t a2_sorter,
-    analytic_index_t a2_start,
-    ffi::BufferR2<ffi::S32> pair,
-    ffi::BufferR2<ffi::S32> tiles,
-    analytic_amp_f64_t amp,
-    analytic_real4_f64_t phase,
-    analytic_real4_f64_t delay,
-    analytic_real3_f64_t wf,
-    analytic_index_t sf,
-    analytic_real3_f64_t gt,
-    analytic_index_t st,
-    analytic_real1_f64_t dnu,
-    ffi::BufferR0<ffi::F64> duration,
-    analytic_real1_f64_t freq,
-    analytic_vis_f64_t cot,
-    ffi::Result<analytic_amp_f64_t> out,
-    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<2, double, ffi::C128, ffi::F64>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, cot, out, nullptr, segments, terms, cubic_terms, scratch_mb);
-}
-extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_transpose, f64)(XLA_FFI_CallFrame *);
-XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_transpose, f64),
-    RI_ANALYTIC_IMPL(_transpose, f64), ffi::Ffi::Bind() RI_ANALYTIC_CONTEXT_BIND
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_index_t>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
-        .Arg<analytic_amp_f64_t>()
-        .Arg<analytic_real4_f64_t>()
-        .Arg<analytic_real4_f64_t>()
-        .Arg<analytic_real3_f64_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_real3_f64_t>()
-        .Arg<analytic_index_t>()
-        .Arg<analytic_real1_f64_t>()
-        .Arg<ffi::BufferR0<ffi::F64>>()
-        .Arg<analytic_real1_f64_t>()
-        .Arg<analytic_vis_f64_t>()
-        .Ret<analytic_amp_f64_t>()
-        .Attr<std::int64_t>("segments")
-        .Attr<std::int64_t>("terms")
-        .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
-
 RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f64)(
     RI_ANALYTIC_CONTEXT,
     analytic_index_t a1,
@@ -474,6 +378,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f64)(
     analytic_real4_f64_t phase,
     analytic_real4_f64_t phase_dot,
     analytic_real4_f64_t delay,
+    analytic_real4_f64_t delay_dot,
     analytic_real3_f64_t wf,
     analytic_index_t sf,
     analytic_real3_f64_t gt,
@@ -483,10 +388,11 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f64)(
     analytic_real1_f64_t freq,
     ffi::Result<analytic_vis_f64_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<3, double, ffi::C128, ffi::F64>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, segments, terms, cubic_terms, scratch_mb);
+    std::int64_t scratch_mb, std::int64_t delay_grad) {
+  return RI_ANALYTIC_DISPATCH<2, double, ffi::C128, ffi::F64>(
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay, delay_dot,
+      wf, sf, gt, st, dnu, duration, freq, *out, out, nullptr, nullptr, segments, terms, cubic_terms,
+      scratch_mb, delay_grad != 0);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_full_jvp, f64)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f64),
@@ -504,6 +410,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f64),
         .Arg<analytic_real4_f64_t>()
         .Arg<analytic_real4_f64_t>()
         .Arg<analytic_real4_f64_t>()
+        .Arg<analytic_real4_f64_t>()
         .Arg<analytic_real3_f64_t>()
         .Arg<analytic_index_t>()
         .Arg<analytic_real3_f64_t>()
@@ -515,7 +422,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f64),
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
+        .Attr<std::int64_t>("scratch_mb")
+        .Attr<std::int64_t>("delay_grad"));
 
 RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f64)(
     RI_ANALYTIC_CONTEXT,
@@ -540,11 +448,13 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f64)(
     analytic_vis_f64_t cot,
     ffi::Result<analytic_amp_f64_t> out,
     ffi::Result<ffi::BufferR4<ffi::F64>> phase_bar,
+    ffi::Result<ffi::BufferR4<ffi::F64>> delay_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
-  return RI_ANALYTIC_DISPATCH<4, double, ffi::C128, ffi::F64>(
-      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay,
-      wf, sf, gt, st, dnu, duration, freq, cot, out, &phase_bar, segments, terms, cubic_terms, scratch_mb);
+    std::int64_t scratch_mb, std::int64_t delay_grad) {
+  return RI_ANALYTIC_DISPATCH<3, double, ffi::C128, ffi::F64>(
+      RI_ANALYTIC_CONTEXT_PASS, a1, a2, pair, tiles, amp, amp, phase, phase, delay, delay,
+      wf, sf, gt, st, dnu, duration, freq, cot, out, &phase_bar, &delay_bar, segments, terms,
+      cubic_terms, scratch_mb, delay_grad != 0);
 }
 extern "C" RI_KERNELS_API XLA_FFI_Error *RI_ANALYTIC_NAME(_full_transpose, f64)(XLA_FFI_CallFrame *);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f64),
@@ -570,7 +480,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f64),
         .Arg<analytic_vis_f64_t>()
         .Ret<analytic_amp_f64_t>()
         .Ret<ffi::BufferR4<ffi::F64>>()
+        .Ret<ffi::BufferR4<ffi::F64>>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
-        .Attr<std::int64_t>("scratch_mb"));
+        .Attr<std::int64_t>("scratch_mb")
+        .Attr<std::int64_t>("delay_grad"));

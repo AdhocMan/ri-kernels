@@ -25,7 +25,7 @@ namespace gpu {
 constexpr int kAnalyticBlock = 128;
 // The delay orders the closed form carries: tau and its first three
 // derivatives, whatever longer path the caller hands in.
-constexpr int kAnalyticOrders = 4;
+constexpr int kAnalyticOrders = kAnalyticDelayOrders;
 
 template <bool JVP, typename T>
 __global__ void analytic_materialise(AnalyticViews<T> v, Cplx<T> *s, Cplx<T> *ds,
@@ -83,25 +83,34 @@ __device__ inline void analytic_atomic(Cplx<T> *dest, Cplx<T> value) {
 // global cotangent. The stencil gather sums partner tiles in order, keeping
 // the scratch bounded by the chunk planner in rfi_analytic_scratch_gpu.cuh.
 //
-// Modes: 0 forward, 1 signal JVP, 2 signal transpose, 3 full JVP (the phase
-// tangent as well), 4 full transpose (the phase cotangent as well). The phase
-// enters every weight as exp(i (phase_p - phase_q)), so its derivative is the
-// pair's own product turned by i: the full JVP adds i (dphase_p - dphase_q) z
-// to every entry and the full transpose sums -Im(sum_ij g_ij z_ij) into p's
-// slot and the opposite into q's, per antenna in shared memory like the
-// coefficient cotangents, written as one partial per partner tile and
-// gathered in order afterwards.
+// Modes: 0 forward, 1 signal JVP, 2 full JVP (the phase tangent as well), 3
+// transpose (the signal and phase cotangents). The phase enters every weight
+// as exp(i (phase_p - phase_q)), so its derivative is the pair's own product
+// turned by i: the full JVP adds i (dphase_p - dphase_q) z to every entry and
+// the transpose sums -Im(sum_ij g_ij z_ij) into p's slot and the opposite into
+// q's, per antenna in shared memory like the coefficient cotangents, written
+// as one partial per partner tile and gathered in order afterwards.
+//
+// Delay, in the last two modes, differentiates the delay as well. Its order
+// k moves one angle of the closed form, so its derivative is the product
+// matrix z_k against that angle's row of weight derivatives
+// (analytic_weights), turned by i and scaled by what the order adds to the
+// angle: the full JVP adds i s_k (ddelay_p - ddelay_q) z_k to every entry, the
+// transpose sums -s_k Im(sum_ij g_ij z_k,ij) and the opposite as for the
+// phase, one partial per order besides.
 //
 // A tile holds, per coefficient m and component e = i * 2 + c, its antennas
 // contiguously: slot (m * ne + e) * kAnalyticTile + il. The block writes both
 // orderings of each pair; the reversed one is the conjugate transpose.
-template <bool Default, int Mode, int P, typename T>
+template <bool Default, int Mode, int P, bool Delay, typename T>
 __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
-    const Cplx<T> *ds, Cplx<T> *partials, T *phase_partials,
+    const Cplx<T> *ds, Cplx<T> *partials, T *phase_partials, T *delay_partials,
     Tensor4D<const Cplx<T> *> cot, Tensor4D<Cplx<T> *> out,
     AnalyticCellChunk<std::int64_t> chunk) {
-  constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
-  constexpr bool Phase = Mode >= 3;
+  constexpr bool JVP = Mode == 1 || Mode == 2, Transpose = Mode == 3;
+  constexpr bool Phase = Mode >= 2;
+  static_assert(!Delay || Phase, "The delay derivative rides on the full passes");
+  constexpr int orders = Delay ? kAnalyticOrders : 1;
   constexpr int pairs_per_thread = kAnalyticTilePairs / kAnalyticBlock;
   constexpr int ne = P * kRfiColumns, npp = P * P;
   extern __shared__ __align__(16) unsigned char shared[];
@@ -118,9 +127,11 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
   constexpr int span = 2 * kAnalyticTile;
   T *sd = reinterpret_cast<T *>(Mode ? xj + slots : sj + slots);
   T *sp = sd + kAnalyticOrders * span;
-  // The phase tangent (full JVP) or the phase cotangent sums (full transpose)
-  // of the two tiles' antennas, laid out like sp.
+  // The phase tangent (full JVP) or the phase cotangent sums (transpose)
+  // of the two tiles' antennas, laid out like sp; the delay's like sd.
   T *sq = Phase ? sp + span : nullptr;
+  T *se = Delay ? sq + span : nullptr;
+  const std::int64_t npath = v.delay.shape[3] < kAnalyticOrders ? v.delay.shape[3] : kAnalyticOrders;
   for (std::int64_t tp = blockIdx.y; tp < v.tile_pairs.shape[0]; tp += gridDim.y) {
     std::int64_t I = 0, rem = tp;
     while (rem >= ntiles - I) { rem -= ntiles - I; ++I; }
@@ -140,8 +151,11 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
           for (int k = 0; k < kAnalyticOrders; ++k)
             sd[k * span + z] = live && k < v.delay.shape[3] ? v.delay(ant, r, t, k) : T(0);
           sp[z] = live ? v.phase(ant, r, f, t) : T(0);
-          if constexpr (Mode == 3) sq[z] = live ? v.phase_dot(ant, r, f, t) : T(0);
-          if constexpr (Mode == 4) sq[z] = T(0);
+          if constexpr (JVP && Phase) sq[z] = live ? v.phase_dot(ant, r, f, t) : T(0);
+          if constexpr (Transpose) sq[z] = T(0);
+          if constexpr (Delay)
+            for (int k = 0; k < kAnalyticOrders; ++k)
+              se[k * span + z] = JVP && live && k < npath ? v.delay_dot(ant, r, t, k) : T(0);
         }
         __syncthreads();
         for (std::int64_t u = 0; u < nu; ++u) {
@@ -170,13 +184,23 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
                 double(sd[2 * span + ip]) - double(sd[2 * span + iq]),
                 double(sd[3 * span + ip]) - double(sd[3 * span + iq]),
                 double(sp[ip]) - double(sp[iq])};
-            Cplx<T> h[AnalyticStorage<Default>::product];
-            analytic_pair_weights<Default, T>(v, d, f, u, h);
+            Cplx<T> h[orders * AnalyticStorage<Default>::product];
+            analytic_pair_weights<Default, T, Delay>(v, d, f, u, h);
+            double scale[Delay ? kAnalyticOrders : 1];
+            if constexpr (Delay) analytic_delay_scales(v, f, u, scale);
             if constexpr (!Transpose) {
-              Cplx<T> z[npp], primal[npp];
-              analytic_contract_pol<Default, P, T>(si + il, sj + jl, xi + il, xj + jl, h, int(nm),
-                                                   ne * kAnalyticTile, kAnalyticTile, JVP, z,
-                                                   Phase ? primal : nullptr);
+              Cplx<T> z[npp], primal[orders * npp];
+              analytic_contract_pol<Default, P, T, orders>(si + il, sj + jl, xi + il, xj + jl, h,
+                                                           int(nm), ne * kAnalyticTile, kAnalyticTile,
+                                                           JVP, z, Phase ? primal : nullptr);
+              if constexpr (Delay) {
+                RI_ANALYTIC_UNROLL
+                for (int o = 0; o < kAnalyticOrders; ++o) {
+                  const T turn = T(scale[o]) * (se[o * span + ip] - se[o * span + iq]);
+                  RI_ANALYTIC_UNROLL
+                  for (int e = 0; e < npp; ++e) z[e] = cadd(z[e], cscale(turn, ctimes_i(primal[o * npp + e])));
+                }
+              }
               RI_ANALYTIC_UNROLL
               for (int e = 0; e < npp; ++e) {
                 if constexpr (Phase) z[e] = cadd(z[e], cscale(sq[ip] - sq[iq], ctimes_i(primal[e])));
@@ -200,15 +224,26 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
               analytic_transpose_pol<Default, P, T>(si + il, sj + jl, g, h, int(nm),
                   ne * kAnalyticTile, kAnalyticTile, xi + il, (I == J ? xi : xj) + jl,
                   [](Cplx<T> *dest, Cplx<T> value) { analytic_atomic(dest, value); });
-              if constexpr (Phase) {
-                Cplx<T> z[npp];
-                analytic_contract_pol<Default, P, T>(si + il, sj + jl, si + il, sj + jl, h, int(nm),
-                                                     ne * kAnalyticTile, kAnalyticTile, false, z);
-                Cplx<T> gz{0, 0};
+              Cplx<T> z[npp], rows[orders * npp];
+              analytic_contract_pol<Default, P, T, orders>(si + il, sj + jl, si + il, sj + jl, h,
+                                                           int(nm), ne * kAnalyticTile, kAnalyticTile,
+                                                           false, z, Delay ? rows : nullptr);
+              Cplx<T> gz{0, 0};
+              RI_ANALYTIC_UNROLL
+              for (int e = 0; e < npp; ++e) gz = cadd(gz, cmul(g[e], z[e]));
+              analytic_add(sq + ip, -gz.im);
+              analytic_add(sq + (I == J ? 0 : kAnalyticTile) + jl, gz.im);
+              if constexpr (Delay) {
                 RI_ANALYTIC_UNROLL
-                for (int e = 0; e < npp; ++e) gz = cadd(gz, cmul(g[e], z[e]));
-                analytic_add(sq + ip, -gz.im);
-                analytic_add(sq + (I == J ? 0 : kAnalyticTile) + jl, gz.im);
+                for (int o = 0; o < kAnalyticOrders; ++o) {
+                  if (o >= npath) break;
+                  Cplx<T> go{0, 0};
+                  RI_ANALYTIC_UNROLL
+                  for (int e = 0; e < npp; ++e) go = cadd(go, cmul(g[e], rows[o * npp + e]));
+                  const T w = T(scale[o]) * go.im;
+                  analytic_add(se + o * span + ip, -w);
+                  analytic_add(se + o * span + (I == J ? 0 : kAnalyticTile) + jl, w);
+                }
               }
             }
           }
@@ -224,7 +259,7 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
             __syncthreads();
           }
         }
-        if constexpr (Mode == 4) {
+        if constexpr (Transpose) {
           // The phase cotangent has no frequency-offset or coefficient axis:
           // one partial per antenna and partner tile for the whole (cell, r).
           for (int z = threadIdx.x; z < span; z += blockDim.x) {
@@ -232,8 +267,12 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
                                      (z % kAnalyticTile);
             if (ant >= na) continue;
             const auto o = ((cell * nr + r) * na + ant) * ntiles;
-            if (z < kAnalyticTile) phase_partials[o + J] = sq[z];
-            else if (I != J) phase_partials[o + I] = sq[z];
+            const auto tile = z < kAnalyticTile ? J : I;
+            if (z >= kAnalyticTile && I == J) continue;
+            phase_partials[o + tile] = sq[z];
+            if constexpr (Delay)
+              for (int k = 0; k < npath; ++k)
+                delay_partials[(o * kAnalyticOrders) + k * ntiles + tile] = se[k * span + z];
           }
           __syncthreads();
         }
@@ -319,22 +358,59 @@ __global__ void analytic_gather_phase(AnalyticViews<T> v, const T *partials,
   }
 }
 
-template <bool Default, int Mode, int P, typename T>
+// The delay cotangent's gather: per antenna, source, cell and order, the
+// chunk's channels and the partner tiles' partials summed in order. The delay
+// has no channel axis, so a time cell split across frequency chunks adds to
+// what its first chunk assigned; orders past the closed form's stay zero.
+template <typename T>
+__global__ void analytic_gather_delay(AnalyticViews<T> v, const T *partials,
+    Tensor4D<T *> out, AnalyticCellChunk<std::int64_t> chunk) {
+  const auto na = v.amp.shape[0], nr = v.amp.shape[1], npath = v.delay.shape[3];
+  const auto ntiles = analytic_tile_count(na);
+  const auto work = chunk.n_tc * nr * na * npath;
+  for (std::int64_t index = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < work; index += std::int64_t(blockDim.x) * gridDim.x) {
+    auto z = index;
+    const auto k = z % npath; z /= npath;
+    const auto ant = z % na; z /= na;
+    const auto r = z % nr;
+    const auto tc = z / nr;
+    T total = 0;
+    if (k < kAnalyticOrders)
+      for (std::int64_t fc = 0; fc < chunk.n_fc; ++fc) {
+        const auto cell = fc * chunk.n_tc + tc;
+        const auto o = ((((cell * nr + r) * na + ant) * kAnalyticOrders) + k) * ntiles;
+        for (std::int64_t tile = 0; tile < ntiles; ++tile) total += partials[o + tile];
+      }
+    auto &dest = out(ant, r, chunk.t0 + tc, k);
+    dest = chunk.f0 == 0 ? total : dest + total;
+  }
+}
+
+template <bool Default, int Mode, int P, bool Delay, typename T>
 ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scratch,
     std::int64_t scratch_budget, AnalyticViews<T> v, Cplx<T> *output,
-    const Cplx<T> *cotangent, T *phase_output) {
-  constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
-  constexpr bool Phase = Mode >= 3;
+    const Cplx<T> *cotangent, T *phase_output, T *delay_output) {
+  constexpr bool JVP = Mode == 1 || Mode == 2, Transpose = Mode == 3;
+  constexpr bool Phase = Mode >= 2;
   constexpr int ne = P * kRfiColumns, npp = P * P;
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nf = v.amp.shape[2], nt = v.amp.shape[3];
   const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = analytic_tile_count(na);
+  const auto npath = v.delay.shape[3];
   std::int64_t per_cell, phase_per_time = 0;
   if (!analytic_checked_product({std::int64_t(sizeof(Cplx<T>)), na, nr, nu, nm, ne}, per_cell))
     return ffi::Error::InvalidArgument("Analytic coefficient size exceeds the 64-bit byte range");
   // The phase partials, one per antenna and partner tile, planned as the
-  // frequency-complete per-time-cell buffer and indexed by the chunk's cells.
-  if (Mode == 4 && !analytic_checked_product({std::int64_t(sizeof(T)), nf, nr, na, ntiles}, phase_per_time))
+  // frequency-complete per-time-cell buffer and indexed by the chunk's cells;
+  // with Delay, as many again per delay order after them.
+  if (Transpose && !analytic_checked_product({std::int64_t(sizeof(T)), nf, nr, na, ntiles,
+                                              1 + (Delay ? kAnalyticOrders : 0)}, phase_per_time))
     return ffi::Error::InvalidArgument("Analytic phase cotangent size exceeds the 64-bit byte range");
+  // Without Delay the transpose's delay cotangent is zero.
+  if (Transpose && !Delay) {
+    auto error = cudaMemsetAsync(delay_output, 0, sizeof(T) * na * nr * nt * npath, stream);
+    if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
+  }
   const std::int64_t buffers = Transpose ? 1 + ntiles : JVP ? 2 : 1;
   AnalyticChunkPlan plan;
   auto status = make_analytic_chunk_plan(nt, nf, per_cell, phase_per_time, buffers, scratch_budget, plan);
@@ -343,17 +419,19 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   if (!mem.has_value()) return ffi::Error::Internal("Could not allocate analytic coefficient scratch");
   Cplx<T> *s = reinterpret_cast<Cplx<T> *>(*mem);
   Cplx<T> *extra = Mode ? s + plan.sample_bytes / sizeof(Cplx<T>) : nullptr;
-  T *phase_partials = Mode == 4 ? reinterpret_cast<T *>(
+  T *phase_partials = Transpose ? reinterpret_cast<T *>(
       reinterpret_cast<unsigned char *>(*mem) + plan.sample_bytes * buffers) : nullptr;
+  T *delay_partials = Transpose && Delay ? phase_partials + plan.n_tc * nf * nr * na * ntiles : nullptr;
   const std::size_t shared = sizeof(Cplx<T>) * nm * ne * kAnalyticTile * (Mode ? 4 : 2) +
-                            sizeof(T) * 2 * kAnalyticTile * (kAnalyticOrders + 1 + (Phase ? 1 : 0));
+                            sizeof(T) * 2 * kAnalyticTile *
+                                (kAnalyticOrders + 1 + (Phase ? 1 : 0) + (Delay ? kAnalyticOrders : 0));
   // Two receivers with the widest stencils need more than the default 48 KiB
   // at double precision; cards that offer more take it by opting in.
   const auto &prop = get_device_prop();
   if (shared > std::max<std::size_t>(prop.sharedMemPerBlock, prop.sharedMemPerBlockOptin))
     return ffi::Error::Internal("Analytic tiles exceed shared memory limit");
   if (shared > prop.sharedMemPerBlock) {
-    const auto error = cudaFuncSetAttribute(reinterpret_cast<const void *>(&analytic_tiles<Default, Mode, P, T>),
+    const auto error = cudaFuncSetAttribute(reinterpret_cast<const void *>(&analytic_tiles<Default, Mode, P, Delay, T>),
                                             cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
     if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
   }
@@ -361,6 +439,7 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   Tensor4D<const Cplx<T> *> cot(cotangent, v.a1.shape[0], nf, nt, npp);
   Tensor5D<Cplx<T> *> bar(output, na, nr, nf, nt, ne);
   Tensor4D<T *> phase_bar(phase_output, na, nr, nf, nt);
+  Tensor4D<T *> delay_bar(delay_output, na, nr, nt, npath);
   for (std::int64_t t0 = 0; t0 < nt; t0 += plan.n_tc) {
     for (std::int64_t f0 = 0; f0 < nf; f0 += plan.n_fc) {
       const AnalyticCellChunk<std::int64_t> chunk{t0, std::min(plan.n_tc, nt - t0), f0, std::min(plan.n_fc, nf - f0)};
@@ -371,8 +450,8 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
       if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
       const auto pair_grid = create_clamped_grid(analytic_grid_extent(chunk.n_tc * chunk.n_fc),
                                                  analytic_grid_extent(v.tile_pairs.shape[0]), 1);
-      analytic_tiles<Default, Mode, P><<<pair_grid, kAnalyticBlock, shared, stream>>>(
-          v, s, extra, extra, phase_partials, cot, out, chunk);
+      analytic_tiles<Default, Mode, P, Delay><<<pair_grid, kAnalyticBlock, shared, stream>>>(
+          v, s, extra, extra, phase_partials, delay_partials, cot, out, chunk);
       error = cudaGetLastError();
       if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
       if constexpr (Transpose) {
@@ -380,13 +459,18 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
         analytic_gather<<<gather_grid, 128, 0, stream>>>(v, extra, bar, chunk, t0 == 0 && f0 == 0);
         error = cudaGetLastError();
         if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
-      }
-      if constexpr (Mode == 4) {
         const auto cells = chunk.n_tc * chunk.n_fc;
         const auto phase_grid = create_clamped_grid(analytic_grid_extent(analytic_ceil_div(cells * nr * na, 128)), 1, 1);
         analytic_gather_phase<<<phase_grid, 128, 0, stream>>>(v, phase_partials, phase_bar, chunk);
         error = cudaGetLastError();
         if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
+        if constexpr (Delay) {
+          const auto delay_grid = create_clamped_grid(
+              analytic_grid_extent(analytic_ceil_div(chunk.n_tc * nr * na * npath, 128)), 1, 1);
+          analytic_gather_delay<<<delay_grid, 128, 0, stream>>>(v, delay_partials, delay_bar, chunk);
+          error = cudaGetLastError();
+          if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
+        }
       }
     }
   }
@@ -398,29 +482,39 @@ ffi::Error analytic_gpu_dispatch(cudaStream_t stream, ffi::ScratchAllocator &scr
     analytic_index_t a1, analytic_index_t a2, ffi::BufferR2<ffi::S32> pair,
     ffi::BufferR2<ffi::S32> tiles, ffi::Buffer<A, 6> amp, ffi::Buffer<A, 6> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
-    ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt, analytic_index_t st,
-    ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
-    ffi::Buffer<A, 5> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 6 : 5>> out,
-    ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
+    ffi::Buffer<R, 4> delay_dot, ffi::Buffer<R, 3> wf, analytic_index_t sf,
+    ffi::Buffer<R, 3> gt, analytic_index_t st, ffi::Buffer<R, 1> dnu,
+    ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
+    ffi::Buffer<A, 5> cot, ffi::Result<ffi::Buffer<A, Mode == 3 ? 6 : 5>> out,
+    ffi::Result<ffi::Buffer<R, 4>> *phase_bar, ffi::Result<ffi::Buffer<R, 4>> *delay_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
-    std::int64_t scratch_mb) {
+    std::int64_t scratch_mb, bool delay_grad) {
   const AnalyticOptions options{segments, terms, cubic_terms};
   auto status = analytic_validate<Mode>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-                                       wf, sf, gt, st, dnu, duration, freq, cot, *out, phase_bar,
-                                       options, false);
+                                       delay_dot, wf, sf, gt, st, dnu, duration, freq, cot, *out,
+                                       phase_bar, delay_bar, options, false);
   if (!status.success()) return status;
   std::int64_t scratch_budget;
   if (!analytic_scratch_bytes(scratch_mb, scratch_budget))
     return ffi::Error::InvalidArgument("Expected scratch_mb to be a positive size in MiB");
   auto v = analytic_views<T>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-                             wf, sf, gt, st, dnu, duration, freq, options);
+                             delay_dot, wf, sf, gt, st, dnu, duration, freq, options);
   auto output = reinterpret_cast<Cplx<T> *>(out->typed_data());
   auto cotangent = reinterpret_cast<const Cplx<T> *>(cot.typed_data());
-  T *phase_output = Mode == 4 ? (*phase_bar)->typed_data() : nullptr;
-  const bool defaults = analytic_is_default(gt.dimensions()[2], options);
+  T *phase_output = Mode == 3 ? (*phase_bar)->typed_data() : nullptr;
+  T *delay_output = Mode == 3 ? (*delay_bar)->typed_data() : nullptr;
+  // Only the full JVP and the transpose differentiate the delay; the others
+  // never instantiate the delay kernels.
+  constexpr bool Full = Mode >= 2;
+  const bool defaults = analytic_is_default(gt.dimensions()[2], options), with_delay = Full && delay_grad;
   return analytic_specialise(defaults, amp.dimensions()[4], [&](auto d, auto p) {
-    return analytic_gpu_launch<decltype(d)::value, Mode, decltype(p)::value>(
-        stream, scratch, scratch_budget, v, output, cotangent, phase_output);
+    constexpr bool D = decltype(d)::value;
+    constexpr int Pol = decltype(p)::value;
+    if (with_delay)
+      return analytic_gpu_launch<D, Mode, Pol, Full>(stream, scratch, scratch_budget, v, output,
+                                                     cotangent, phase_output, delay_output);
+    return analytic_gpu_launch<D, Mode, Pol, false>(stream, scratch, scratch_budget, v, output,
+                                                    cotangent, phase_output, delay_output);
   });
 }
 

@@ -1,6 +1,7 @@
 // Each CPU task stages one cell's antenna coefficients and then contracts its
 // baselines. The transpose owns a source, so its stencil scatters cannot race
 // with another task and no atomics or per-thread data-grid copies are needed.
+#include <algorithm>
 #include <vector>
 #include "parallel_for.hpp"
 #include "rfi_analytic_common.hpp"
@@ -11,11 +12,16 @@ namespace ri_kernels {
 // Phase carries the phase tangent through the JVP: each entry of the pair's
 // P x P product turned by i and scaled by the antennas' tangent difference
 // (see analytic_contract). One set of weights serves every entry.
-template <bool Default, int P, bool JVP, bool Phase, typename T>
+// Delay carries the delay tangent likewise, against the weights' derivatives
+// in each angle, scaled by what the delay order adds to that angle.
+template <bool Default, int P, bool JVP, bool Phase, bool Delay, typename T>
 void analytic_cpu_cells(std::int64_t begin, std::int64_t end,
     AnalyticViews<T> v, Tensor4D<Cplx<T> *> out) {
   static_assert(!Phase || JVP, "The phase tangent rides on the JVP");
+  static_assert(!Delay || Phase, "The delay tangent rides on the full JVP");
   constexpr int ne = P * kRfiColumns, npp = P * P;
+  constexpr int orders = Delay ? kAnalyticDelayOrders : 1;
+  const auto np = std::min<std::int64_t>(v.delay.shape[3], kAnalyticDelayOrders);
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nt = v.amp.shape[3];
   const auto nm = v.gt.shape[2], nu = v.wf.shape[2], nb = v.a1.shape[0];
   std::vector<Cplx<T>> coefficients(na * nm * ne), dots(JVP ? na * nm * ne : 0);
@@ -37,42 +43,59 @@ void analytic_cpu_cells(std::int64_t begin, std::int64_t end,
         }
         for (std::int64_t bl = 0; bl < nb; ++bl) {
           const auto p = v.a1(bl), q = v.a2(bl);
-          Cplx<double> h[AnalyticStorage<Default>::product];
-          analytic_pair_weights<Default, double>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
-          Cplx<T> z[npp], primal[npp];
-          analytic_contract_pol<Default, P, double>(coefficients.data() + p, coefficients.data() + q,
-              JVP ? dots.data() + p : nullptr, JVP ? dots.data() + q : nullptr, h, int(nm),
-              ne * na, na, JVP, z, Phase ? primal : nullptr);
+          Cplx<double> h[orders * AnalyticStorage<Default>::product];
+          analytic_pair_weights<Default, double, Delay>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
+          Cplx<T> z[npp], primal[orders * npp];
+          analytic_contract_pol<Default, P, double, orders>(coefficients.data() + p,
+              coefficients.data() + q, JVP ? dots.data() + p : nullptr,
+              JVP ? dots.data() + q : nullptr, h, int(nm), ne * na, na, JVP, z,
+              Phase ? primal : nullptr);
           const T dphase = Phase ? T(v.phase_dot(p, r, f, t)) - T(v.phase_dot(q, r, f, t)) : T(0);
-          for (int k = 0; k < npp; ++k) {
+          for (int k = 0; k < npp; ++k)
             if constexpr (Phase) z[k] = cadd(z[k], cscale(dphase, ctimes_i(primal[k])));
-            out(bl, f, t, k) = cadd(out(bl, f, t, k), cscale(T(1) / T(nu), z[k]));
+          if constexpr (Delay) {
+            double scale[kAnalyticDelayOrders];
+            analytic_delay_scales(v, f, u, scale);
+            for (std::int64_t o = 0; o < np; ++o) {
+              const T turn = T(scale[o] * (double(v.delay_dot(p, r, t, o)) - double(v.delay_dot(q, r, t, o))));
+              for (int k = 0; k < npp; ++k) z[k] = cadd(z[k], cscale(turn, ctimes_i(primal[o * npp + k])));
+            }
           }
+          for (int k = 0; k < npp; ++k)
+            out(bl, f, t, k) = cadd(out(bl, f, t, k), cscale(T(1) / T(nu), z[k]));
         }
       }
     }
   }
 }
 
-// Phase adds the phase's cotangent: for V = exp(i (phase_p - phase_q)) K the
-// pair's product matrix z gives phase_bar_p -= Im(sum_ij g_ij z_ij) and
-// phase_bar_q += the same, JAX's real cotangent Re(g dV/dphase). The task owns
+// The signal's cotangent and the phase's: for V = exp(i (phase_p - phase_q)) K
+// the pair's product matrix z gives phase_bar_p -= Im(sum_ij g_ij z_ij) and
+// phase_bar_q += the same, JAX's real cotangent Re(g dV/dphase). With Delay,
+// the delay's the same way from the product matrix against each row of weight
+// derivatives, scaled by what the order adds to that row's angle and summed
+// over the channels too; without it the delay cotangent is zero. The task owns
 // a source, so the per-antenna sums need no atomics either.
-template <bool Default, int P, bool Phase, typename T>
+template <bool Default, int P, bool Delay, typename T>
 void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
     AnalyticViews<T> v, Tensor4D<const Cplx<T> *> cot, Tensor5D<Cplx<T> *> out,
-    Tensor4D<T *> phase_bar) {
+    Tensor4D<T *> phase_bar, Tensor4D<T *> delay_bar) {
   constexpr int ne = P * kRfiColumns, npp = P * P;
+  constexpr int orders = Delay ? kAnalyticDelayOrders : 1;
   const auto na = v.amp.shape[0], nf = v.amp.shape[2], nt = v.amp.shape[3];
-  const auto nm = v.gt.shape[2], nu = v.wf.shape[2];
+  const auto nm = v.gt.shape[2], nu = v.wf.shape[2], npath = v.delay.shape[3];
+  const auto np = std::min<std::int64_t>(npath, kAnalyticDelayOrders);
   std::vector<Cplx<T>> coefficients(na * nm * ne), bars(na * nm * ne);
   for (auto r = begin; r < end; ++r) {
-    for (std::int64_t ant = 0; ant < na; ++ant)
+    for (std::int64_t ant = 0; ant < na; ++ant) {
       for (std::int64_t f = 0; f < nf; ++f)
         for (std::int64_t t = 0; t < nt; ++t) {
           for (int e = 0; e < ne; ++e) out(ant, r, f, t, e) = {0, 0};
-          if constexpr (Phase) phase_bar(ant, r, f, t) = 0;
+          phase_bar(ant, r, f, t) = 0;
         }
+      for (std::int64_t t = 0; t < nt; ++t)
+        for (std::int64_t k = 0; k < npath; ++k) delay_bar(ant, r, t, k) = 0;
+    }
     for (std::int64_t f = 0; f < nf; ++f) {
       for (std::int64_t t = 0; t < nt; ++t) {
         for (std::int64_t u = 0; u < nu; ++u) {
@@ -85,19 +108,28 @@ void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
               }
           for (std::int64_t bl = 0; bl < v.a1.shape[0]; ++bl) {
             const auto p = v.a1(bl), q = v.a2(bl);
-            Cplx<double> h[AnalyticStorage<Default>::product];
-            analytic_pair_weights<Default, double>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
+            Cplx<double> h[orders * AnalyticStorage<Default>::product];
+            analytic_pair_weights<Default, double, Delay>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
             Cplx<T> g[npp];
             for (int k = 0; k < npp; ++k) g[k] = cscale(T(1) / T(nu), cot(bl, f, t, k));
-            if constexpr (Phase) {
-              Cplx<T> z[npp];
-              analytic_contract_pol<Default, P, double>(coefficients.data() + p,
-                  coefficients.data() + q, coefficients.data() + p, coefficients.data() + q, h,
-                  int(nm), ne * na, na, false, z);
-              Cplx<T> s{0, 0};
-              for (int k = 0; k < npp; ++k) s = cadd(s, cmul(g[k], z[k]));
-              phase_bar(p, r, f, t) -= s.im;
-              phase_bar(q, r, f, t) += s.im;
+            Cplx<T> z[npp], rows[orders * npp];
+            analytic_contract_pol<Default, P, double, orders>(coefficients.data() + p,
+                coefficients.data() + q, coefficients.data() + p, coefficients.data() + q, h,
+                int(nm), ne * na, na, false, z, Delay ? rows : nullptr);
+            Cplx<T> s{0, 0};
+            for (int k = 0; k < npp; ++k) s = cadd(s, cmul(g[k], z[k]));
+            phase_bar(p, r, f, t) -= s.im;
+            phase_bar(q, r, f, t) += s.im;
+            if constexpr (Delay) {
+              double scale[kAnalyticDelayOrders];
+              analytic_delay_scales(v, f, u, scale);
+              for (std::int64_t o = 0; o < np; ++o) {
+                Cplx<T> so{0, 0};
+                for (int k = 0; k < npp; ++k) so = cadd(so, cmul(g[k], rows[o * npp + k]));
+                const T w = T(scale[o]) * so.im;
+                delay_bar(p, r, t, o) -= w;
+                delay_bar(q, r, t, o) += w;
+              }
             }
             analytic_transpose_pol<Default, P, double>(coefficients.data() + p,
                 coefficients.data() + q, g, h, int(nm), ne * na, na, bars.data() + p,
@@ -126,37 +158,49 @@ ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
     analytic_index_t a1, analytic_index_t a2, ffi::BufferR2<ffi::S32> pair,
     ffi::BufferR2<ffi::S32> tiles, ffi::Buffer<A, 6> amp, ffi::Buffer<A, 6> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
-    ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt, analytic_index_t st,
-    ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
-    ffi::Buffer<A, 5> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 6 : 5>> out,
-    ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
-    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms, std::int64_t) {
-  constexpr bool Transpose = Mode == 2 || Mode == 4, Phase = Mode >= 3;
+    ffi::Buffer<R, 4> delay_dot, ffi::Buffer<R, 3> wf, analytic_index_t sf,
+    ffi::Buffer<R, 3> gt, analytic_index_t st, ffi::Buffer<R, 1> dnu,
+    ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
+    ffi::Buffer<A, 5> cot, ffi::Result<ffi::Buffer<A, Mode == 3 ? 6 : 5>> out,
+    ffi::Result<ffi::Buffer<R, 4>> *phase_bar, ffi::Result<ffi::Buffer<R, 4>> *delay_bar,
+    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms, std::int64_t,
+    bool delay_grad) {
+  constexpr bool Transpose = Mode == 3, Phase = Mode >= 2;
   const AnalyticOptions options{segments, terms, cubic_terms};
   auto status = analytic_validate<Mode>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-                                       wf, sf, gt, st, dnu, duration, freq, cot, *out, phase_bar,
-                                       options, true);
+                                       delay_dot, wf, sf, gt, st, dnu, duration, freq, cot, *out,
+                                       phase_bar, delay_bar, options, true);
   if (!status.success()) return completed_future(std::move(status));
   const auto a = amp.dimensions();
   const std::int64_t nb = a1.element_count(), npol = a[4];
   const bool defaults = analytic_is_default(gt.dimensions()[2], options);
   const auto v = analytic_views<T>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
-                                  wf, sf, gt, st, dnu, duration, freq, options);
+                                  delay_dot, wf, sf, gt, st, dnu, duration, freq, options);
   if constexpr (Transpose) {
+    const auto dd = delay.dimensions();
     Tensor5D<Cplx<T> *> output(reinterpret_cast<Cplx<T> *>(out->typed_data()), a[0], a[1], a[2], a[3], a[4] * a[5]);
-    Tensor4D<T *> pb(Phase ? (*phase_bar)->typed_data() : nullptr, a[0], a[1], a[2], a[3]);
+    Tensor4D<T *> pb((*phase_bar)->typed_data(), a[0], a[1], a[2], a[3]);
+    Tensor4D<T *> db((*delay_bar)->typed_data(), dd[0], dd[1], dd[2], dd[3]);
     Tensor4D<const Cplx<T> *> g(reinterpret_cast<const Cplx<T> *>(cot.typed_data()), nb, a[2], a[3], npol * npol);
-    return parallel_for(pool, a[1], [v, output, pb, g, defaults, npol](auto b, auto e) {
+    return parallel_for(pool, a[1], [v, output, pb, db, g, defaults, npol, delay_grad](auto b, auto e) {
       analytic_specialise(defaults, npol, [&](auto d, auto p) {
-        analytic_cpu_transpose<decltype(d)::value, decltype(p)::value, Phase>(b, e, v, g, output, pb);
+        constexpr bool D = decltype(d)::value;
+        constexpr int Pol = decltype(p)::value;
+        if (delay_grad) analytic_cpu_transpose<D, Pol, true>(b, e, v, g, output, pb, db);
+        else analytic_cpu_transpose<D, Pol, false>(b, e, v, g, output, pb, db);
       });
     });
   } else {
     Tensor4D<Cplx<T> *> output(reinterpret_cast<Cplx<T> *>(out->typed_data()), nb, a[2], a[3], npol * npol);
-    constexpr bool JVP = Mode == 1 || Mode == 3;
-    return parallel_for(pool, a[2] * a[3], [v, output, defaults, npol](auto b, auto e) {
+    constexpr bool JVP = Mode == 1 || Mode == 2;
+    // Only the full JVP carries the delay tangent.
+    const bool with_delay = Phase && delay_grad;
+    return parallel_for(pool, a[2] * a[3], [v, output, defaults, npol, with_delay](auto b, auto e) {
       analytic_specialise(defaults, npol, [&](auto d, auto p) {
-        analytic_cpu_cells<decltype(d)::value, decltype(p)::value, JVP, Phase>(b, e, v, output);
+        constexpr bool D = decltype(d)::value;
+        constexpr int Pol = decltype(p)::value;
+        if (with_delay) analytic_cpu_cells<D, Pol, JVP, Phase, Phase>(b, e, v, output);
+        else analytic_cpu_cells<D, Pol, JVP, Phase, false>(b, e, v, output);
       });
     });
   }

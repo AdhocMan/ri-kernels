@@ -143,20 +143,42 @@ pairs the baselines cover there (`tile_pair_list`), which the staged GPU
 kernels work through a tile pair per block; each `(a1, a2)` baseline may
 appear at most once.
 
-`amp` and `phase` are differentiated; `delay_us`, `int_time` and the tables
-are constants whose gradients `eval` stops. Two kernel pairs carry the
-derivatives: a JVP and transpose for the signal alone,
-and a full pair that takes the phase tangent as well and returns its
-cotangent. The phase enters every cell's weights as the one factor
+`amp`, `phase` and `delay_us` are differentiated; `int_time` and the tables
+are constants whose gradients `eval` stops. Two JVP kernels carry the
+tangents, one for the signal alone and a full one that takes the phase and
+delay tangents as well; one transpose kernel serves both and always returns
+the phase cotangent with the signal's. The phase enters every cell's weights as the one factor
 `exp(i (phase[a1] - phase[a2]))`, so the phase tangent turns the pair's
 product by `i` (`dV = i (dphase[a1] - dphase[a2]) V` per source and fine
 channel, for every matrix entry) and the cotangent is `-Im(Σ_ij g_ij V_ij)` on
 `a1` and the opposite on `a2`, summed over the baseline's sources and fine
-channels; both cost one extra
-contraction against weights the kernel has already formed. The JVP rule binds
-the signal-only pair whenever the phase tangent is a symbolic zero, so a
-fixed orbit computes no phase derivative. The compiled JVPs and transposes
-follow JAX's complex cotangent convention.
+channels; both cost one extra contraction against weights the kernel has
+already formed.
+
+The delay's four orders move the closed form's angles: the delay itself the
+centre phase (by `2π dnu τ`), the rate the winding `a`, the curvature `b` and
+the jerk the cubic `c`. The weights integrate `x^m exp(i (φ + a x + b x² +
+c x³))`, so their derivatives in these are the weights of one, two and three
+orders higher, turned by `i`; the curvature and cubic series are truncated, so
+the kernels subtract what the truncation leaves out of their derivatives, and
+the delay gradient is that of the visibility as computed. Every matrix entry
+shares the weights, so the delay cotangent sums `-s Im(Σ_ij g_ij V'_ij)` on
+`a1` and the opposite on `a2` over the sources, the channels and the fine
+channels, with `V'` the pair's matrix against the order's derivative weights
+and `s` what a unit of the order adds to its angle.
+Orders above three, and the third with `cubic_terms=0`, get a zero gradient.
+The three further weight orders make the delay derivative cost about half as
+much again as the full pass without it, so the full JVP and the transpose form
+it only when the delay tangent is not a symbolic zero. The transpose further
+skips it when the delay tangent is a constant of the map being transposed,
+and under `jax.jit` dead-code elimination switches it off when nothing reads
+the delay cotangent (say, only the amplitude and phase gradients are kept).
+
+The JVP rule binds the signal-only JVP whenever the phase and delay tangents
+are symbolic zeros, so a fixed orbit's forward mode computes no phase
+derivative; its VJP still computes the phase cotangent and drops it, but no
+delay cotangent unless the delay is differentiated. The compiled JVPs and
+transposes follow JAX's complex cotangent convention.
 
 The moment branches, segmentation and cubic translation follow
 `tabascal.coarse_rfi_vis.analytic_rfi_vis`. `segments`, `terms`, and
@@ -200,14 +222,15 @@ python -m pytest tests/test_rfi_analytic_vis_op.py
 python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
 ```
 
-The analytic tests compare both precisions, P = 1 and 2, and the amplitude
-and phase derivatives against a frozen float64 JAX reference; the polarised
-matrix is recovered from its scalar form by the polarisation identity. They
-cover zero winding, both recurrence branches, the Fresnel boundary, cubic
-translation, wider coefficient counts, sparse/reversed/autocorrelation
-baselines, partial antenna tiles and forced scratch splitting. The benchmark
-reports synchronised forward, JVP and VJP times, signal-only and with the
-phase, after compilation and warmup. It uses
+The analytic tests compare both precisions, P = 1 and 2, and the amplitude,
+phase and delay derivatives against a frozen float64 JAX reference; the
+polarised matrix is recovered from its scalar form by the polarisation
+identity. They cover zero winding, both recurrence branches, the Fresnel
+boundary, cubic translation, wider coefficient counts,
+sparse/reversed/autocorrelation baselines, partial antenna tiles and forced
+scratch splitting. The benchmark reports synchronised forward, JVP and VJP
+times, signal-only, with the phase and with the delay, after compilation and
+warmup. It uses
 synthetic inputs; repeat the scientific accuracy check and the 100-iteration
 optimisation with the production SKA-Low data. Inspect ptxas register/spill
 reports and Nsight local-memory traffic for the default specialisation (at

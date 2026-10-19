@@ -1,4 +1,4 @@
-"""Analytic CPU/CUDA values and amplitude and phase derivatives against the JAX specification."""
+"""Analytic CPU/CUDA values and amplitude, phase and delay derivatives against the JAX specification."""
 from collections import namedtuple
 from functools import partial
 
@@ -10,7 +10,7 @@ import pytest
 from analytic_reference import analytic_rfi_vis
 from ri_kernels.jax_api.rfi_analytic_vis_op import (
     RFIAnalyticVisOp, _TAB_LIB_ANALYTIC, _TAB_LIB_ANALYTIC_GPU,
-    rfi_analytic_vis_op, rfi_analytic_jvp_op, rfi_analytic_transpose_op,
+    rfi_analytic_vis_op, rfi_analytic_jvp_op,
     rfi_analytic_full_jvp_op, rfi_analytic_full_transpose_op,
 )
 
@@ -192,61 +192,78 @@ def assert_close(actual, expected, real):
 CPU = jax.devices("cpu")[0]
 DEFAULT_OPTIONS = dict(segments=2, terms=6, cubic_terms=3)
 
-# The value; the JVPs of the signal alone, the phase alone and both; the
-# signal's cotangent from the signal-only and from the full pullback; and the
-# phase's cotangent.
-Results = namedtuple("Results", "value amp_jvp phase_jvp full_jvp amp_bar full_amp_bar phase_bar")
+# The value; the JVPs of the signal, the phase and the delay alone and of all
+# three; the signal's cotangent from the signal-only pullback, the signal's and
+# the phase's from the pullback of the two, and all three from the full one.
+Results = namedtuple(
+    "Results",
+    "value amp_jvp phase_jvp delay_jvp full_jvp amp_bar phase_bar full_amp_bar full_phase_bar delay_bar",
+)
 
 
 @partial(jax.jit, static_argnames=("segments", "terms", "cubic_terms"))
-def _expected(args, a1, a2, amp_dot, phase_dot, g, *, segments, terms, cubic_terms):
-    fn = lambda amp, phase: reference(amp, phase, *args[2:], a1=a1, a2=a2, segments=segments,
-                                      terms=terms, cubic_terms=cubic_terms)
-    value, full_jvp = jax.jvp(fn, tuple(args[:2]), (amp_dot, phase_dot))
-    amp_jvp = jax.jvp(fn, tuple(args[:2]), (amp_dot, jnp.zeros_like(phase_dot)))[1]
-    amp_bar, phase_bar = jax.vjp(fn, *args[:2])[1](g)
-    return Results(value, amp_jvp, full_jvp - amp_jvp, full_jvp, amp_bar, amp_bar, phase_bar)
+def _expected(args, a1, a2, amp_dot, phase_dot, delay_dot, g, *, segments, terms, cubic_terms):
+    fn = lambda amp, phase, delay: reference(amp, phase, delay, *args[3:], a1=a1, a2=a2,
+                                             segments=segments, terms=terms, cubic_terms=cubic_terms)
+    primals, zero = tuple(args[:3]), jnp.zeros_like
+    value, full_jvp = jax.jvp(fn, primals, (amp_dot, phase_dot, delay_dot))
+    amp_jvp = jax.jvp(fn, primals, (amp_dot, zero(phase_dot), zero(delay_dot)))[1]
+    delay_jvp = jax.jvp(fn, primals, (zero(amp_dot), zero(phase_dot), delay_dot))[1]
+    amp_bar, phase_bar, delay_bar = jax.vjp(fn, *primals)[1](g)
+    return Results(value, amp_jvp, full_jvp - amp_jvp - delay_jvp, delay_jvp, full_jvp,
+                   amp_bar, phase_bar, amp_bar, phase_bar, delay_bar)
 
 
-def expected(args, a1, a2, amp_dot, phase_dot, g, **options):
+def expected(args, a1, a2, amp_dot, phase_dot, delay_dot, g, **options):
     """The reference's Results, in float64 on the CPU."""
     with jax.default_device(CPU):
         put = lambda x: jax.device_put(upcast(x), CPU)
         return _expected(tuple(map(put, args)), put(a1), put(a2), put(amp_dot),
-                         put(phase_dot), put(g), **{**DEFAULT_OPTIONS, **options})
+                         put(phase_dot), put(delay_dot), put(g), **{**DEFAULT_OPTIONS, **options})
 
 
-def kernel_results(op, args, amp_dot, phase_dot, g, **options):
+def kernel_results(op, args, amp_dot, phase_dot, delay_dot, g, **options):
     """The operator's Results: every handler, with the value checked eagerly too."""
     options = {**DEFAULT_OPTIONS, **options}
-    rest = args[2:]
-    fn = lambda a, p: op.eval(a, p, *rest, **options)
+    rest = args[3:]
+    fn = lambda a, p, d: op.eval(a, p, d, *rest, **options)
 
     @jax.jit
-    def run(a, p, da, dp, g):
-        value, full_jvp = jax.jvp(fn, (a, p), (da, dp))
-        # A symbolic-zero phase tangent binds the signal-only JVP, a zero
-        # signal tangent the full one.
-        amp_jvp = jax.jvp(lambda x: fn(x, p), (a,), (da,))[1]
-        phase_jvp = jax.jvp(lambda y: fn(a, y), (p,), (dp,))[1]
-        amp_bar = jax.vjp(lambda x: fn(x, p), a)[1](g)[0]
-        full_amp_bar, phase_bar = jax.vjp(fn, a, p)[1](g)
-        return Results(value, amp_jvp, phase_jvp, full_jvp, amp_bar, full_amp_bar, phase_bar)
+    def run(a, p, d, da, dp, dd, g):
+        value, full_jvp = jax.jvp(fn, (a, p, d), (da, dp, dd))
+        # Symbolic-zero phase and delay tangents bind the signal-only JVP;
+        # anything else the full one, which forms the delay's derivative only
+        # for a delay tangent.
+        amp_jvp = jax.jvp(lambda x: fn(x, p, d), (a,), (da,))[1]
+        phase_jvp = jax.jvp(lambda y: fn(a, y, d), (p,), (dp,))[1]
+        delay_jvp = jax.jvp(lambda z: fn(a, p, z), (d,), (dd,))[1]
+        amp_bar = jax.vjp(lambda x: fn(x, p, d), a)[1](g)[0]
+        amp_phase_bar = jax.vjp(lambda x, y: fn(x, y, d), a, p)[1](g)
+        full_bar = jax.vjp(fn, a, p, d)[1](g)
+        return Results(value, amp_jvp, phase_jvp, delay_jvp, full_jvp, amp_bar,
+                       amp_phase_bar[1], *full_bar)
 
-    results = run(args[0], args[1], amp_dot, phase_dot, g)
-    assert_close(fn(*args[:2]), results.value, args[1].dtype)
+    results = run(*args[:3], amp_dot, phase_dot, delay_dot, g)
+    assert_close(fn(*args[:3]), results.value, args[1].dtype)
     return results
 
 
+# What a delay tangent of one moves the angles by differs by orders of
+# magnitude between the orders; these bring each order's share of the full
+# JVP near the phase's.
+DELAY_TANGENT_SCALES = np.array([10., 1e-3, 1e-3, 1e-3, 1e-3, 1e-3])
+
+
 def perturbations(args, n_bl, seed=1):
-    """Random signal and phase tangents and a visibility cotangent."""
+    """Random signal, phase and delay tangents and a visibility cotangent."""
     rng = np.random.default_rng(seed)
-    amp, phase = args[:2]
+    amp, phase, delay = args[:3]
     out = (n_bl,) + amp.shape[2:4] + (amp.shape[4],) * 2
     amp_dot = rng.normal(size=amp.shape) + 1j * rng.normal(size=amp.shape)
     g = rng.normal(size=out) + 1j * rng.normal(size=out)
+    delay_dot = rng.normal(size=delay.shape) * DELAY_TANGENT_SCALES[:delay.shape[-1]]
     return (jnp.asarray(amp_dot, amp.dtype), jnp.asarray(rng.normal(size=phase.shape), phase.dtype),
-            jnp.asarray(g, amp.dtype))
+            jnp.asarray(delay_dot, delay.dtype), jnp.asarray(g, amp.dtype))
 
 
 def check(op, args, a1, a2, seed=1, **options):
@@ -260,11 +277,13 @@ def check(op, args, a1, a2, seed=1, **options):
             assert_close(value, ref, real)
         except AssertionError as error:
             raise AssertionError(f"{name}: {error}") from None
-    assert actual.value.dtype == args[0].dtype and actual.phase_bar.dtype == real
+    assert actual.value.dtype == args[0].dtype
+    assert actual.phase_bar.dtype == actual.delay_bar.dtype == real
     # The pairing is real and bilinear under JAX's complex cotangent convention.
-    amp_dot, phase_dot, g = perturbation
+    amp_dot, phase_dot, delay_dot, g = perturbation
     assert_close(jnp.real(jnp.sum(g * actual.full_jvp)),
-                 jnp.real(jnp.sum(actual.full_amp_bar * amp_dot)) + jnp.sum(actual.phase_bar * phase_dot),
+                 jnp.real(jnp.sum(actual.full_amp_bar * amp_dot)) +
+                 jnp.sum(actual.full_phase_bar * phase_dot) + jnp.sum(actual.delay_bar * delay_dot),
                  real)
     return actual
 
@@ -376,48 +395,77 @@ def test_sparse_reversed_and_auto_baselines(precision, device, pol, n_ant):
 
 
 def test_constants_and_zero_tangent(precision, device):
-    """eval() stops the gradient on the delay, the interval and the tables;
-    the signal and the phase get cotangents."""
+    """eval() stops the gradient on the interval and the tables; the signal,
+    the phase and the delay get cotangents."""
     real, complex_ = precision
     args = make_inputs(real, complex_)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
     value, pullback = jax.vjp(op.eval, *args)
     bars = pullback(jnp.ones_like(value))
-    assert np.max(np.abs(bars[0])) > 0
-    assert np.max(np.abs(bars[1])) > 0
-    for i in [2, 3, 5, 7, 8, 9]:
+    for i in [0, 1, 2]:
+        assert np.max(np.abs(bars[i])) > 0
+    for i in [3, 5, 7, 8, 9]:
         np.testing.assert_array_equal(bars[i], jnp.zeros_like(args[i]))
-    _, dot = jax.jvp(lambda d: op.eval(args[0], args[1], d, *args[3:]), (args[2],), (jnp.ones_like(args[2]),))
+    _, dot = jax.jvp(lambda w: op.eval(*args[:3], w, *args[4:]), (args[3],), (jnp.ones_like(args[3]),))
     np.testing.assert_array_equal(dot, jnp.zeros_like(value))
 
 
-def test_the_signal_only_kernels_serve_a_fixed_phase():
-    """A fixed phase binds the signal-only JVP and transpose; a differentiated
-    phase binds the full pair."""
+def test_the_signal_only_jvp_serves_a_fixed_phase_and_delay():
+    """A fixed phase and delay bind the signal-only JVP, a differentiated
+    phase or delay the full JVP; every VJP binds the one transpose, which
+    forms the delay's derivative only when the delay is differentiated."""
     args = make_inputs(jnp.float32, jnp.complex64)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
     cot = jnp.ones((len(a1),) + args[0].shape[2:4] + (2, 2), dtype=jnp.complex64)
-    names = ("rfi_analytic_jvp_op", "rfi_analytic_transpose_op",
-             "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
+    names = ("rfi_analytic_jvp_op", "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
 
-    def primitives(fn, *primals):
+    def primitives(text):
+        return {name for name in names if name in text}, "delay_grad=True" in text
+
+    def backward(fn, *primals):
         _, pullback = jax.vjp(fn, *primals)
-        text = str(jax.make_jaxpr(pullback)(cot))
-        return {name for name in names if name in text}
+        return primitives(str(jax.make_jaxpr(pullback)(cot)))
 
-    used = primitives(lambda a: op.eval(a, *args[1:]), args[0])
-    assert "rfi_analytic_transpose_op" in used and "rfi_analytic_full_transpose_op" not in used
-    used = primitives(lambda a, p: op.eval(a, p, *args[2:]), args[0], args[1])
-    assert "rfi_analytic_full_transpose_op" in used and "rfi_analytic_transpose_op" not in used
-    used = primitives(lambda p: op.eval(args[0], p, *args[2:]), args[1])
-    assert "rfi_analytic_full_transpose_op" in used
-    # Forward mode likewise.
-    text = str(jax.make_jaxpr(lambda a, t: jax.jvp(lambda x: op.eval(x, *args[1:]), (a,), (t,)))(args[0], args[0]))
-    assert "rfi_analytic_jvp_op" in text and "rfi_analytic_full_jvp_op" not in text
-    text = str(jax.make_jaxpr(lambda p, t: jax.jvp(lambda x: op.eval(args[0], x, *args[2:]), (p,), (t,)))(args[1], args[1]))
-    assert "rfi_analytic_full_jvp_op" in text and "rfi_analytic_jvp_op" not in text
+    def forward(fn, primal):
+        return primitives(str(jax.make_jaxpr(lambda x, t: jax.jvp(fn, (x,), (t,)))(primal, primal)))
+
+    transpose = {"rfi_analytic_full_transpose_op"}
+    assert backward(lambda a: op.eval(a, *args[1:]), args[0]) == (transpose, False)
+    assert backward(lambda a, p: op.eval(a, p, *args[2:]), args[0], args[1]) == (transpose, False)
+    assert backward(lambda p: op.eval(args[0], p, *args[2:]), args[1]) == (transpose, False)
+    assert backward(lambda d: op.eval(*args[:2], d, *args[3:]), args[2]) == (transpose, True)
+    assert backward(op.eval, *args) == (transpose, True)
+    assert forward(lambda x: op.eval(x, *args[1:]), args[0]) == ({"rfi_analytic_jvp_op"}, False)
+    assert forward(lambda x: op.eval(args[0], x, *args[2:]), args[1]) == ({"rfi_analytic_full_jvp_op"}, False)
+    assert forward(lambda x: op.eval(*args[:2], x, *args[3:]), args[2]) == ({"rfi_analytic_full_jvp_op"}, True)
+
+
+def test_the_delay_cotangent_is_formed_only_when_read():
+    """A delay tangent that is a constant of the transposed map, or a delay
+    cotangent that jit finds unused, leaves the delay's derivative out."""
+    args = make_inputs(jnp.float32, jnp.complex64)
+    a1, a2 = make_baselines(args[0].shape[0])
+    op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
+    fn = lambda a, p, d: op.eval(a, p, d, *args[3:])
+
+    def lin(t):
+        # Concrete zero tangents for the phase and the delay: the full JVP.
+        zeros = (jnp.zeros_like(args[1]), jnp.zeros_like(args[2]))
+        return jax.jvp(fn, tuple(args[:3]), (t, *zeros))[1]
+
+    assert "delay_grad=True" in str(jax.make_jaxpr(lin)(args[0]))
+    cot = jnp.ones(lin(args[0]).shape, dtype=jnp.complex64)
+    assert "delay_grad=True" not in str(jax.make_jaxpr(jax.linear_transpose(lin, args[0]))(cot))
+
+    loss = lambda *x: jnp.sum(jnp.abs(fn(*x)) ** 2)
+    every = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+    kept = jax.jit(lambda *x: jax.grad(loss, argnums=(0, 1, 2))(*x)[:2])
+    assert "delay_grad = 1" in every.lower(*args[:3]).as_text()
+    assert "delay_grad = 0" in kept.lower(*args[:3]).as_text()
+    for x, y in zip(kept(*args[:3]), every(*args[:3])):
+        np.testing.assert_array_equal(x, y)
 
 
 def test_cubic_translation_matters(device):
@@ -462,17 +510,21 @@ def test_direct_bind_derivatives_and_shapes():
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
     options = dict(segments=2, terms=6, cubic_terms=3, scratch_mb=256)
-    with pytest.raises(TypeError, match="amp and phase only"):
-        jax.jvp(lambda delay: rfi_analytic_vis_op.bind(*op.indices, *args[:2], delay, *args[3:], **options),
-                (args[2],), (jnp.ones_like(args[2]),))
+    with pytest.raises(TypeError, match="amp, phase and delay_us only"):
+        jax.jvp(lambda w: rfi_analytic_vis_op.bind(*op.indices, *args[:3], w, *args[4:], **options),
+                (args[3],), (jnp.ones_like(args[3]),))
     with pytest.raises(ValueError, match="signal tangent"):
         rfi_analytic_jvp_op.bind(*op.indices, args[0], args[0][:-1], *args[1:], **options)
-    with pytest.raises(ValueError, match="visibility cotangent"):
-        rfi_analytic_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128), **options)
+    amp, phase, delay = args[:3]
     with pytest.raises(ValueError, match="phase tangent"):
-        rfi_analytic_full_jvp_op.bind(*op.indices, args[0], args[0], args[1], args[1][:-1], *args[2:], **options)
+        rfi_analytic_full_jvp_op.bind(*op.indices, amp, amp, phase, phase[:-1], delay, delay, *args[3:],
+                                      delay_grad=False, **options)
+    with pytest.raises(ValueError, match="delay tangent"):
+        rfi_analytic_full_jvp_op.bind(*op.indices, amp, amp, phase, phase, delay, delay[:-1], *args[3:],
+                                      delay_grad=True, **options)
     with pytest.raises(ValueError, match="visibility cotangent"):
-        rfi_analytic_full_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128), **options)
+        rfi_analytic_full_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128),
+                                            delay_grad=True, **options)
 
 
 def test_invalid_cpu_values(device):
@@ -499,9 +551,11 @@ def test_empty_baselines(precision, device, pol):
     args = make_inputs(real, complex_, pol=pol)
     empty = jnp.array([], jnp.int32)
     op = RFIAnalyticVisOp(5, empty, empty)
-    value, pullback = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])
+    value, pullback = jax.vjp(lambda a, d: op.eval(a, args[1], d, *args[3:]), args[0], args[2])
     assert value.shape == (0, 3, 6, pol, pol)
-    np.testing.assert_array_equal(pullback(jnp.zeros_like(value))[0], jnp.zeros_like(args[0]))
+    amp_bar, delay_bar = pullback(jnp.zeros_like(value))
+    np.testing.assert_array_equal(amp_bar, jnp.zeros_like(args[0]))
+    np.testing.assert_array_equal(delay_bar, jnp.zeros_like(args[2]))
 
 
 @pytest.mark.parametrize("shape,options", [
@@ -531,10 +585,12 @@ def test_gpu_scratch_chunks(real_name, device, pol):
     if device.platform == "cpu":
         pytest.skip("Scratch chunking is a GPU path")
     # This shape forces a frequency split at 1 MiB even for complex64. The
-    # final chunks are short on both axes, and edge stencils cross chunks.
+    # final chunks are short on both axes, and edge stencils cross chunks. One
+    # cell of the complex128, P = 2 delay transpose, with its frequency-complete
+    # phase and delay partials, still fits.
     real = getattr(jnp, real_name)
     complex_ = jnp.complex64 if real == jnp.float32 else jnp.complex128
-    args = make_inputs(real, complex_, pol=pol, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=9)
+    args = make_inputs(real, complex_, pol=pol, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=7)
     a1 = jnp.array([0, 64, 31, 32, 0, 32, 64], jnp.int32)
     a2 = jnp.array([64, 0, 32, 31, 0, 32, 64], jnp.int32)
     op = RFIAnalyticVisOp(65, a1, a2)
