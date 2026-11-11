@@ -35,6 +35,7 @@ from .rfi_vis_op import (
     _TAB_LIB,
     _TAB_LIB_GPU,
     _TAB_PLATFORM_NAME,
+    _check_no_vma,
     _check_tab_lib,
     _check_tab_lib_gpu,
     _dtype_suffix,
@@ -99,36 +100,19 @@ class RFIAnalyticVisOp:
     """
 
     def __init__(self, n_ant, a1, a2):
-        a1, a2 = np.asarray(a1), np.asarray(a2)
-        if (a1.ndim != 1 or a2.shape != a1.shape or
-                a1.dtype.kind not in "iu" or a2.dtype.kind not in "iu" or
-                n_ant < 1 or np.any(a1 < 0) or np.any(a2 < 0) or
-                np.any(a1 >= n_ant) or np.any(a2 >= n_ant)):
-            raise ValueError("Expected matching antenna-index vectors within [0, n_ant)")
-        # The staged GPU kernels form every pair of two antenna tiles once and
-        # write it to whichever orderings the list holds, so a pair must not
-        # appear twice: the second copy would never be written.
-        if len(np.unique(np.stack([a1, a2], axis=1), axis=0)) != len(a1):
-            raise ValueError("RFIAnalyticVisOp needs each (a1, a2) baseline at most once")
-        self.a1 = jnp.asarray(a1, jnp.int32)
-        self.a2 = jnp.asarray(a2, jnp.int32)
         (
-            self.a1_sorter,
-            self.a1_start,
-            self.a2_sorter,
-            self.a2_start,
-        ) = prepare_indices(n_ant, self.a1, self.a2)
-        # The baseline index of each antenna pair, -1 where the list has none.
-        self.pair_index = (
-            jnp.full((n_ant, n_ant), -1, dtype=jnp.int32)
-            .at[self.a1, self.a2]
-            .set(jnp.arange(len(a1), dtype=jnp.int32))
-        )
-        self.tile_pairs = jnp.asarray(tile_pair_list(n_ant, a1, a2))
+            self.a1, self.a1_sorter, self.a1_start,
+            self.a2, self.a2_sorter, self.a2_start,
+            self.pair_index, self.tile_pairs,
+        ) = analytic_indices(n_ant, a1, a2)
 
     @property
     def indices(self):
-        """The index arrays every primitive takes before the data arrays."""
+        """The index arrays every primitive takes before the data arrays.
+
+        The tuple :func:`analytic_indices` builds and
+        :func:`analytic_eval_with_indices` expects.
+        """
         return (
             self.a1, self.a1_sorter, self.a1_start,
             self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.tile_pairs,
@@ -169,16 +153,102 @@ class RFIAnalyticVisOp:
         transposes, more passes over the cotangent. A budget below one cell and
         channel fails at run time.
         """
-        _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms,
-                          scratch_mb=scratch_mb)
-        stop = jax.lax.stop_gradient
-        int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
-        return rfi_analytic_vis_op.bind(
-            *self.indices, amp, phase, delay_us, stop(w_freq),
-            start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
-            stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
-            scratch_mb=scratch_mb,
+        return analytic_eval_with_indices(
+            self.indices, amp, phase, delay_us, w_freq, start_freq, g_time,
+            start_time, dnu_mhz, int_time, freq_mhz, segments=segments,
+            terms=terms, cubic_terms=cubic_terms, scratch_mb=scratch_mb,
         )
+
+
+def analytic_indices(n_ant, a1, a2):
+    """The index arrays of :class:`RFIAnalyticVisOp` for a baseline list.
+
+    Returns ``(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair_index,
+    tile_pairs)``, all int32: the tuple :func:`analytic_eval_with_indices`
+    takes and :attr:`RFIAnalyticVisOp.indices` holds. ``a1_start`` and
+    ``a2_start`` have length ``n_ant``, ``pair_index`` is ``(n_ant, n_ant)``
+    and ``tile_pairs`` is :func:`tile_pair_list`, so only ``a1``, ``a1_sorter``,
+    ``a2`` and ``a2_sorter`` grow with the number of baselines.
+
+    a1 and a2 must be concrete, since the tile-pair list is built on the host,
+    and each ``(a1, a2)`` pair may appear at most once (see
+    :func:`analytic_eval_with_indices`).
+    """
+    a1, a2 = np.asarray(a1), np.asarray(a2)
+    if (a1.ndim != 1 or a2.shape != a1.shape or
+            a1.dtype.kind not in "iu" or a2.dtype.kind not in "iu" or
+            n_ant < 1 or np.any(a1 < 0) or np.any(a2 < 0) or
+            np.any(a1 >= n_ant) or np.any(a2 >= n_ant)):
+        raise ValueError("Expected matching antenna-index vectors within [0, n_ant)")
+    # The staged GPU kernels form every pair of two antenna tiles once and
+    # write it to whichever orderings the list holds, so a pair must not
+    # appear twice: the second copy would never be written.
+    if len(np.unique(np.stack([a1, a2], axis=1), axis=0)) != len(a1):
+        raise ValueError("RFIAnalyticVisOp needs each (a1, a2) baseline at most once")
+    j1 = jnp.asarray(a1, jnp.int32)
+    j2 = jnp.asarray(a2, jnp.int32)
+    a1_sorter, a1_start, a2_sorter, a2_start = prepare_indices(n_ant, j1, j2)
+    # The baseline index of each antenna pair, -1 where the list has none.
+    pair_index = (
+        jnp.full((n_ant, n_ant), -1, dtype=jnp.int32)
+        .at[j1, j2]
+        .set(jnp.arange(len(a1), dtype=jnp.int32))
+    )
+    tile_pairs = jnp.asarray(tile_pair_list(n_ant, a1, a2))
+    return (j1, a1_sorter, a1_start, j2, a2_sorter, a2_start, pair_index, tile_pairs)
+
+
+def analytic_eval_with_indices(
+    indices, amp, phase, delay_us, w_freq, start_freq, g_time, start_time,
+    dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6, cubic_terms=3,
+    scratch_mb=SCRATCH_MB,
+):
+    """:meth:`RFIAnalyticVisOp.eval` with the index arrays passed in, not stored on an op.
+
+    An :class:`RFIAnalyticVisOp` stores the index arrays of one fixed baseline
+    list. Inside a function that ``shard_map`` maps over the baseline axis,
+    those stored arrays are constants that every device sees whole, so every
+    device would compute every baseline. Build each device's indices with
+    :func:`analytic_indices`, pass them as a mapped argument and call this
+    function in the mapped body instead. The output has one row per entry of
+    ``a1``, so a device computes exactly the rows for its own baselines.
+
+    ``indices`` is the 8-tuple :func:`analytic_indices` returns. The other
+    arguments and the gradients are as in :meth:`RFIAnalyticVisOp.eval`:
+    amp, phase and delay_us are differentiated, and the tables and int_time
+    are constants.
+
+    Padding: when the baseline count does not divide evenly across devices,
+    each device's list has to be padded to the same length, and here, unlike
+    for :class:`~ri_kernels.jax_api.RFIVisOp`, the padding pairs must be
+    distinct from each other and from the device's real pairs. The staged GPU
+    kernels never write a second copy of a pair, and only
+    :func:`analytic_indices` checks for one. Inside ``shard_map`` nothing
+    does. Ordered pairs count as distinct, so ``(p, q)``, ``(q, p)`` and the
+    autocorrelations ``(p, p)`` are all available. A device's list always
+    has room, because ``n_ant ** 2`` ordered pairs exist. Two ways to pad:
+    reuse real pairs that are not in the device's list, which keeps the
+    index shapes as they are, or add dark ghost antennas with zero
+    amplitude, which widens ``n_ant`` and with it ``pair_index`` and
+    ``tile_pairs``. Discard the padded rows of the output. They then get a
+    zero cotangent and add nothing to the gradients.
+    """
+    if len(indices) != N_IDX:
+        raise ValueError(
+            f"Expected the {N_IDX} RFIAnalyticVisOp index arrays (a1, a1_sorter, "
+            f"a1_start, a2, a2_sorter, a2_start, pair_index, tile_pairs); "
+            f"got {len(indices)}"
+        )
+    _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms,
+                      scratch_mb=scratch_mb)
+    stop = jax.lax.stop_gradient
+    int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
+    return rfi_analytic_vis_op.bind(
+        *indices, amp, phase, delay_us, stop(w_freq),
+        start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
+        stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
+        scratch_mb=scratch_mb,
+    )
 
 
 _ANALYTIC_PASSES = ("fwd", "jvp", "full_jvp", "full_transpose")
@@ -332,6 +402,7 @@ rfi_analytic_full_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analyti
 
 
 def _full_transpose_abstract(*args, **options):
+    _check_no_vma("rfi_analytic_full_transpose_op", *args)
     _validate_options(**options)
     a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
     _validate(*arrays)
@@ -369,6 +440,7 @@ rfi_analytic_jvp_op.def_impl(partial(xla.apply_primitive, rfi_analytic_jvp_op))
 
 
 def _jvp_abstract(*args, **options):
+    _check_no_vma("rfi_analytic_jvp_op", *args)
     _validate_options(**options)
     a1, amp, amp_dot, rest = args[0], args[N_IDX], args[N_IDX + 1], args[N_IDX + 2:]
     _validate(amp, *rest)
@@ -417,6 +489,7 @@ rfi_analytic_full_jvp_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full
 
 
 def _full_jvp_abstract(*args, **options):
+    _check_no_vma("rfi_analytic_full_jvp_op", *args)
     _validate_options(**options)
     a1 = args[0]
     amp, amp_dot, phase, phase_dot, delay, delay_dot = args[N_IDX:N_IDX + 6]
@@ -460,6 +533,7 @@ rfi_analytic_vis_op.def_impl(partial(xla.apply_primitive, rfi_analytic_vis_op))
 
 
 def _vis_abstract(*args, **options):
+    _check_no_vma("rfi_analytic_vis_op", *args)
     _validate_options(**options)
     arrays = args[N_IDX:]
     _validate(*arrays)

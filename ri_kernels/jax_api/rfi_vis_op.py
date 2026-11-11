@@ -39,30 +39,70 @@ class RFIVisOp:
         """
         self.a1 = a1
         self.a2 = a2
-        self.a1_sorter = jnp.argsort(a1).astype(a1.dtype)
-        self.a2_sorter = jnp.argsort(a2).astype(a1.dtype)
+        (
+            self.a1_sorter,
+            self.a1_start,
+            self.a2_sorter,
+            self.a2_start,
+        ) = prepare_indices(n_ant, a1, a2)
 
-        v = jnp.arange(0, n_ant, dtype=a1.dtype)
-        self.a1_start = jnp.searchsorted(a1, v, sorter=self.a1_sorter)
-        self.a2_start = jnp.searchsorted(a2, v, sorter=self.a2_sorter)
-    
+    @property
+    def indices(self):
+        """The index arrays the primitive takes before the data arrays.
+
+        ``(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start)``, the tuple
+        :func:`vis_eval_with_indices` expects.
+        """
+        return (
+            self.a1, self.a1_sorter, self.a1_start,
+            self.a2, self.a2_sorter, self.a2_start,
+        )
+
     def eval(self, rfi_amp_fine, rfi_phase):
         """
         Evaluate the RFI visibility for given RFI amplitudes and phases.
-        
+
         Args:
             rfi_amp_fine: Fine-grained RFI amplitude array with shape
                          (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
             rfi_phase: RFI phase array with shape matching rfi_amp_fine.
-        
+
         Returns:
             Array of RFI visibilities with shape (n_baselines, n_freq, n_time).
         """
-        return rfi_vis_op.bind(
-            self.a1, self.a1_sorter, self.a1_start,
-            self.a2, self.a2_sorter, self.a2_start,
-            rfi_amp_fine, rfi_phase
+        return vis_eval_with_indices(self.indices, rfi_amp_fine, rfi_phase)
+
+
+def vis_eval_with_indices(indices, rfi_amp_fine, rfi_phase):
+    """:meth:`RFIVisOp.eval` with the index arrays passed in, not stored on an op.
+
+    An :class:`RFIVisOp` stores the index arrays of one fixed baseline list.
+    Inside a function that ``shard_map`` maps over the baseline axis, those
+    stored arrays are constants that every device sees whole, so every device
+    would compute every baseline. Pass each device its own indices as a mapped
+    argument and call this function in the mapped body instead. The output
+    has one row per entry of ``a1``, so a device computes exactly the rows for
+    its own baselines.
+
+    Args:
+        indices: ``(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start)``, as
+            returned by :attr:`RFIVisOp.indices` for the device's baseline list.
+            ``a1_start`` and ``a2_start`` have length ``n_ant`` whatever the
+            number of baselines.
+        rfi_amp_fine, rfi_phase: As in :meth:`RFIVisOp.eval`.
+
+    Padding: when the baseline count does not divide evenly across devices,
+    each device's list has to be padded to the same length. Any valid antenna
+    pair works as padding, a pair the list already holds included. Discard
+    the padded rows of the output. They then get a zero cotangent and add
+    nothing to the gradients.
+    """
+    if len(indices) != 6:
+        raise ValueError(
+            f"Expected the 6 RFIVisOp index arrays (a1, a1_sorter, a1_start, a2, "
+            f"a2_sorter, a2_start); got {len(indices)}"
         )
+    return rfi_vis_op.bind(*indices, rfi_amp_fine, rfi_phase)
 
 
 def prepare_indices(n_ant, a1, a2):
@@ -194,6 +234,36 @@ def _dtype_suffix(amp_dtype, phase_dtype):
     )
 
 
+def _varying_axes(aval):
+    """The manual mesh axes ``aval`` varies over inside ``shard_map``.
+
+    Non-empty only under ``shard_map(..., check_vma=True)``. JAX spells this
+    ``aval.mat.varying`` from 0.11 and ``aval.vma`` before that.
+    """
+    mat = getattr(aval, "mat", None)
+    if mat is not None:
+        return frozenset(getattr(mat, "varying", ()))
+    return frozenset(getattr(aval, "vma", ()))
+
+
+def _check_no_vma(name, *avals):
+    """Refuse to trace under ``shard_map`` with ``check_vma=True``.
+
+    The primitives' abstract evaluation does not propagate the varying manual
+    axes, so with checking on JAX would treat a per-device result as
+    replicated. The values still come out right, but the transpose then omits
+    the psum of the cotangents of replicated inputs, and their gradients are
+    silently wrong. Fail here instead.
+    """
+    axes = frozenset().union(*(_varying_axes(a) for a in avals))
+    if axes:
+        raise ValueError(
+            f"{name} cannot track the varying manual axes {sorted(axes)}: call it "
+            f"inside shard_map(..., check_vma=False) (check_rep=False before "
+            f"jax 0.7), as for jax.ffi.ffi_call."
+        )
+
+
 def _check_tab_lib():
     if _TAB_LIB is None:
         raise RuntimeError(
@@ -226,6 +296,10 @@ def rfi_transpose_abstract(
     """
     Abstract evaluation for the RFI transpose operation.
     """
+    _check_no_vma(
+        "rfi_transpose_op",
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g,
+    )
     _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
     # Shapes are implicitly checked by JAX mechanisms or assumed correct from lowering
     t1 = ShapedArray(rfi_amp_fine.shape, rfi_amp_fine.dtype)
@@ -303,6 +377,11 @@ def rfi_jvp_abstract(
     """
     Abstract evaluation for the RFI JVP operation.
     """
+    _check_no_vma(
+        "rfi_jvp_op",
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start,
+        rfi_amp_fine, rfi_amp_fine_grad, rfi_phase, rfi_phase_grad,
+    )
     _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
     # rfi_amp_fine and rfi_phase shape is
     # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)
@@ -420,6 +499,10 @@ def rfi_vis_abstract(
     """
     Abstract evaluation for the RFI visibility operation.
     """
+    _check_no_vma(
+        "rfi_vis_op",
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase,
+    )
     _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
     # rfi_amp_fine and rfi_phase shape is
     # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)

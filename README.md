@@ -71,6 +71,55 @@ ROCm, so both forward- and reverse-mode differentiation stay inside the
 kernels. Precision has to match across the inputs: complex64 with float32, or
 complex128 with float64. Both amplitudes and phases are differentiated.
 
+## Sharding the baseline axis
+
+Both operators hold the index arrays of one fixed baseline list. Inside a
+function mapped by `shard_map` over the baselines, those arrays are constants
+every device sees whole, so every device would compute every baseline.
+Instead, build each device's indices on the host, pass them in as a mapped
+argument, and call the `*_with_indices` functions in the mapped body:
+
+```python
+from ri_kernels.jax_api import (
+    RFIVisOp, vis_eval_with_indices,              # indices: 6-tuple
+    analytic_indices, analytic_eval_with_indices,  # indices: 8-tuple
+)
+
+per_device = [analytic_indices(n_ant, a1_d, a2_d) for a1_d, a2_d in device_lists]
+stacked = tuple(jnp.stack(x) for x in zip(*per_device))
+
+def body(idx, amp, phase, delay_us, *tables):
+    idx = tuple(x[0] for x in idx)
+    return analytic_eval_with_indices(idx, amp, phase, delay_us, *tables)
+
+vis = shard_map(body, mesh=mesh, in_specs=(P("bl"),) + (P(),) * 10,
+                out_specs=P("bl"), check_vma=False)(stacked, amp, phase, delay_us, *tables)
+```
+
+For `RFIVisOp`, `RFIVisOp(n_ant, a1_d, a2_d).indices` gives a device's
+tuple. Only `a1`, `a2` and their sorters grow with the baseline count. The
+`*_start` arrays, `pair_index` and `tile_pairs` are sized by `n_ant`.
+
+Pass `check_vma=False` (`check_rep=False` before jax 0.7), as for
+`jax.ffi.ffi_call`. The primitives do not propagate the varying manual axes.
+With checking on, the transpose would skip the psum over the replicated
+inputs' cotangents and return wrong gradients, so the primitives raise an
+error instead.
+
+When the baseline count does not divide evenly across the devices, pad each
+device's list to the same length and drop the padded rows from the output.
+Dropped rows get a zero cotangent and add nothing to the gradients.
+
+- `RFIVisOp`: any valid pair is fine as padding, a duplicate of a pair the
+  list already holds included.
+- `RFIAnalyticVisOp`: every pair must be distinct within a device's list. The
+  staged GPU kernels never write a second copy of a pair, and only
+  `analytic_indices` checks for one. Inside `shard_map` nothing does.
+  Ordered pairs count as distinct, so `(p, q)`, `(q, p)` and `(p, p)` are all
+  available. Either reuse real pairs that are not in the device's list (the
+  index shapes stay as they are) or add dark ghost antennas, which widens
+  `n_ant` and with it `pair_index` and `tile_pairs`.
+
 ## Analytic RFI visibilities
 
 `RFIAnalyticVisOp` integrates the time polynomial against phase moments, with
